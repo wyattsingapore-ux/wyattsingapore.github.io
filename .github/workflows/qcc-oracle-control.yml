@@ -1,0 +1,32 @@
+name: QCC Oracle Control
+
+on:
+  push:
+    branches: [qcc-chatgpt-ops]
+    paths:
+      - qcc-control-command.txt
+
+permissions:
+  contents: read
+
+jobs:
+  qcc-control:
+    runs-on: [self-hosted, linux, x64, qcc-oracle]
+    timeout-minutes: 5
+    steps:
+      - name: Read allowlisted command
+        id: cmd
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmd="$(curl -fsSL 'https://raw.githubusercontent.com/wyattsingapore-ux/wyattsingapore.github.io/qcc-chatgpt-ops/qcc-control-command.txt' | tr -d '\r\n')"
+          case "$cmd" in
+            status|trigger-logs|mcp-logs|tests|scanner-status|scanner-smoke|pull-ops|restart-trigger|restart-mcp) ;;
+            *) echo "Rejected command: $cmd" >&2; exit 64 ;;
+          esac
+          echo "command=$cmd" >> "$GITHUB_OUTPUT"
+      - name: Execute restricted Oracle dispatcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/ops_dispatch.py "${{ steps.cmd.outputs.command }}"
