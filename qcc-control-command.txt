@@ -1,1 +1,1 @@
-dispatcher-diff
+dispatcher-clean-mode
