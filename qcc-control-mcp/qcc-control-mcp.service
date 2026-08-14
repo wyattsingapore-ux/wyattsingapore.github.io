@@ -1,0 +1,24 @@
+[Unit]
+Description=QCC Control MCP (restricted localhost bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp
+Environment=PYTHONUNBUFFERED=1
+Environment=QCC_MCP_TRANSPORT=streamable-http
+Environment=QCC_MCP_HOST=127.0.0.1
+Environment=QCC_MCP_PORT=8765
+ExecStart=/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/.mcp-venv/bin/python /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/server.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops
+
+[Install]
+WantedBy=multi-user.target
