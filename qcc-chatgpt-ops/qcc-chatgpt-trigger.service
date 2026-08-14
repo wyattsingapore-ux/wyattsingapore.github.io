@@ -1,0 +1,19 @@
+[Unit]
+Description=QCC ChatGPT 1-Minute Trigger Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/openclaw_workspace/quant_command_centre
+Environment=PYTHONUNBUFFERED=1
+# Codex: add EnvironmentFile=-<existing QCC env path> here; do not copy secrets into this file.
+ExecStart=/home/ubuntu/openclaw_workspace/quant_command_centre/venv/bin/python /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/chatgpt_trigger_monitor.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
