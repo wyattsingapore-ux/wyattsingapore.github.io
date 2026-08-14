@@ -1,0 +1,19 @@
+[Unit]
+Description=QCC ChatGPT Quota-Aware Opportunity Scanner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/chatgpt-trigger.env
+ExecStart=/home/ubuntu/openclaw_workspace/quant_command_centre/venv/bin/python /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/chatgpt_opportunity_scanner.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
