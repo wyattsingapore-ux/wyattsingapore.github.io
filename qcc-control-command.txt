@@ -1,1 +1,1 @@
-scanner-status
+install-opportunity
