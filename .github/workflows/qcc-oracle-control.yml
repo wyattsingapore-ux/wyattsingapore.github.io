@@ -21,7 +21,7 @@ jobs:
           set -euo pipefail
           cmd="$(curl -fsSL -H 'Accept: application/vnd.github.raw+json' "https://api.github.com/repos/wyattsingapore-ux/wyattsingapore.github.io/contents/qcc-control-command.txt?ref=${GITHUB_SHA}" | tr -d '\r\n')"
           case "$cmd" in
-            status|trigger-logs|opportunity-logs|mcp-logs|tests|scanner-status|scanner-smoke|pull-ops|install-opportunity|restart-trigger|restart-opportunity|restart-mcp|stop-trigger) ;;
+            status|trigger-logs|opportunity-logs|mcp-logs|tests|scanner-status|scanner-smoke|pull-ops|install-opportunity|restart-trigger|restart-opportunity|restart-mcp|stop-trigger|dispatcher-diff) ;;
             *) echo "Rejected command: $cmd" >&2; exit 64 ;;
           esac
           echo "command=$cmd" >> "$GITHUB_OUTPUT"
@@ -29,4 +29,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/ops_dispatch.py "${{ steps.cmd.outputs.command }}"
+          cmd="${{ steps.cmd.outputs.command }}"
+          if [ "$cmd" = "dispatcher-diff" ]; then
+            git -C /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops status --short -- qcc-control-mcp/ops_dispatch.py
+            git -C /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops diff -- qcc-control-mcp/ops_dispatch.py
+          else
+            /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/ops_dispatch.py "$cmd"
+          fi
