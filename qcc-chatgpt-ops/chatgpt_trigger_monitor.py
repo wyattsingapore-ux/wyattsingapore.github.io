@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import statistics
@@ -16,14 +17,15 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
-PROJECT_ROOT = Path(__file__).resolve().parent
+UTC = ZoneInfo("UTC")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_STATE = PROJECT_ROOT / "logs" / "chatgpt_trigger_state.json"
 DEFAULT_LOG = PROJECT_ROOT / "logs" / "chatgpt_trigger_monitor.log"
 
@@ -51,7 +53,7 @@ def load_known_envs() -> None:
     explicit = os.getenv("QCC_ENV_FILE")
     if explicit:
         candidates.append(Path(explicit))
-    candidates += [Path.cwd() / ".env", Path.cwd() / "qcc" / ".env"]
+    candidates += [PROJECT_ROOT / ".env", PROJECT_ROOT / "qcc" / ".env"]
     for p in candidates:
         load_env_file(p)
 
@@ -118,7 +120,8 @@ class TwelveDataClient:
             "timezone": "America/New_York",
             "apikey": self.api_key,
         })
-        req = Request(f"{self.BASE}/time_series?{params}", headers={"User-Agent": "qcc-chatgpt-trigger/1.0"})
+        url = f"{self.BASE}/time_series?{params}"
+        req = Request(url, headers={"User-Agent": "qcc-chatgpt-trigger/1.0"})
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -126,13 +129,23 @@ class TwelveDataClient:
             raise MonitorError(f"Twelve Data HTTP {e.code}") from e
         except (URLError, TimeoutError, json.JSONDecodeError) as e:
             raise MonitorError(f"Twelve Data request failed: {type(e).__name__}") from e
+
         if payload.get("status") == "error" or "values" not in payload:
-            raise MonitorError(f"Twelve Data error: {payload.get('message', 'invalid response')}")
+            msg = payload.get("message", "invalid response")
+            raise MonitorError(f"Twelve Data error: {msg}")
+
         bars: List[Bar] = []
         for item in payload["values"]:
             try:
                 dt = datetime.strptime(item["datetime"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=ET)
-                bars.append(Bar(dt, float(item["open"]), float(item["high"]), float(item["low"]), float(item["close"]), float(item.get("volume") or 0)))
+                bars.append(Bar(
+                    dt=dt,
+                    open=float(item["open"]),
+                    high=float(item["high"]),
+                    low=float(item["low"]),
+                    close=float(item["close"]),
+                    volume=float(item.get("volume") or 0),
+                ))
             except (KeyError, TypeError, ValueError):
                 continue
         if len(bars) < 25:
@@ -156,8 +169,9 @@ class TelegramClient:
     def send(self, text: str) -> None:
         if not self.configured:
             raise MonitorError("Telegram not configured")
+        url = f"{self.BASE}/bot{self.token}/sendMessage"
         body = urlencode({"chat_id": self.chat_id, "text": text}).encode("utf-8")
-        req = Request(f"{self.BASE}/bot{self.token}/sendMessage", data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
+        req = Request(url, data=body, headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
@@ -170,6 +184,8 @@ class TelegramClient:
 
 
 def ema(values: List[float], period: int) -> float:
+    if len(values) < period:
+        raise MonitorError(f"Need {period} values for EMA")
     alpha = 2.0 / (period + 1.0)
     result = sum(values[:period]) / period
     for value in values[period:]:
@@ -178,25 +194,78 @@ def ema(values: List[float], period: int) -> float:
 
 
 def atr(bars: List[Bar], period: int = 14) -> float:
-    trs = [max(cur.high-cur.low, abs(cur.high-prev.close), abs(cur.low-prev.close)) for prev, cur in zip(bars[:-1], bars[1:])]
+    if len(bars) < period + 1:
+        raise MonitorError("Insufficient bars for ATR")
+    trs = []
+    for prev, cur in zip(bars[:-1], bars[1:]):
+        trs.append(max(cur.high - cur.low, abs(cur.high - prev.close), abs(cur.low - prev.close)))
     return sum(trs[-period:]) / period
 
 
 def relative_volume(bars: List[Bar], baseline: int = 20) -> float:
+    if len(bars) < baseline + 1:
+        raise MonitorError("Insufficient bars for relative volume")
+    current = bars[-1].volume
     prior = [b.volume for b in bars[-(baseline + 1):-1] if b.volume > 0]
     if not prior:
         return 0.0
     mean = statistics.fmean(prior)
-    return bars[-1].volume / mean if mean else 0.0
+    return current / mean if mean else 0.0
 
 
 def split_current_and_completed(bars: List[Bar], now_et: datetime) -> Tuple[float, List[Bar]]:
+    """Return observed latest price and conservatively finalized 1-minute bars.
+
+    Twelve Data documents that REST candles can take up to roughly two minutes
+    after close to become final. We therefore exclude bars whose *end time* is
+    newer than CHATGPT_FINALIZATION_LAG_SEC (default 120s).
+    """
+    if not bars:
+        raise MonitorError("No bars")
     observed_price = bars[-1].close
-    minute_floor = now_et.replace(second=0, microsecond=0)
-    completed = [b for b in bars if b.dt < minute_floor]
+    lag = env_int("CHATGPT_FINALIZATION_LAG_SEC", 120)
+    cutoff = now_et - timedelta(seconds=lag)
+    completed = [b for b in bars if b.dt + timedelta(minutes=1) <= cutoff]
     if len(completed) < 25:
-        raise MonitorError("Insufficient completed bars")
+        raise MonitorError("Insufficient finalized 1m bars")
     return observed_price, completed
+
+
+def aggregate_5m(bars: List[Bar]) -> List[Bar]:
+    """Aggregate finalized 1-minute bars into complete, aligned 5-minute bars.
+
+    Only buckets containing all five contiguous one-minute bars are emitted.
+    This gives us Claude-style 5-minute confirmation without another API call.
+    """
+    buckets = {}
+    for b in bars:
+        minute = (b.dt.minute // 5) * 5
+        key = b.dt.replace(minute=minute, second=0, microsecond=0)
+        buckets.setdefault(key, []).append(b)
+    out: List[Bar] = []
+    for key in sorted(buckets):
+        group = sorted(buckets[key], key=lambda x: x.dt)
+        if len(group) != 5:
+            continue
+        expected = [key + timedelta(minutes=i) for i in range(5)]
+        if [b.dt for b in group] != expected:
+            continue
+        out.append(Bar(
+            key, group[0].open, max(b.high for b in group),
+            min(b.low for b in group), group[-1].close,
+            sum(b.volume for b in group),
+        ))
+    return out
+
+
+def entry_cutoff_passed(now_et: datetime) -> bool:
+    raw = os.getenv("CHATGPT_ENTRY_CUTOFF_ET", "15:30")
+    try:
+        hh, mm = (int(x) for x in raw.split(":", 1))
+    except Exception:
+        hh, mm = 15, 30
+    cutoff = now_et.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return now_et >= cutoff
 
 
 def fixed_trigger(symbol: str, side: str) -> Optional[float]:
@@ -206,45 +275,64 @@ def fixed_trigger(symbol: str, side: str) -> Optional[float]:
             try:
                 return float(raw)
             except ValueError:
-                pass
+                continue
     return None
 
 
 def derive_snapshot(symbol: str, bars: List[Bar], now_et: datetime) -> SignalSnapshot:
-    observed, completed = split_current_and_completed(bars, now_et)
+    observed, finalized_1m = split_current_and_completed(bars, now_et)
+    completed = aggregate_5m(finalized_1m)
+    if len(completed) < 22:
+        raise MonitorError("Insufficient complete 5m bars for indicators")
     confirm = completed[-1]
     lookback = env_int("CHATGPT_TRIGGER_LOOKBACK", 12)
     rv_period = env_int("CHATGPT_RVOL_BASELINE", 20)
-    manual_up, manual_down = fixed_trigger(symbol, "UP"), fixed_trigger(symbol, "DOWN")
+    if len(completed) < max(22, lookback + 2, rv_period + 2):
+        raise MonitorError("Insufficient complete 5m bars for indicators")
+
+    manual_up = fixed_trigger(symbol, "UP")
+    manual_down = fixed_trigger(symbol, "DOWN")
     structure = completed[-(lookback + 1):-1]
     if manual_up is not None or manual_down is not None:
         up = manual_up if manual_up is not None else max(b.high for b in structure)
         down = manual_down if manual_down is not None else min(b.low for b in structure)
-        mode = "manual" if manual_up is not None and manual_down is not None else "hybrid"
+        mode = "manual-5m" if manual_up is not None and manual_down is not None else "hybrid-5m"
     else:
-        up, down, mode = max(b.high for b in structure), min(b.low for b in structure), "auto"
+        up, down, mode = max(b.high for b in structure), min(b.low for b in structure), "auto-5m"
+
     rv = relative_volume(completed, rv_period)
     closes = [b.close for b in completed]
     e9, e21, a14 = ema(closes, 9), ema(closes, 21), atr(completed, 14)
-    threshold = env_float("CHATGPT_RVOL_THRESHOLD", 1.5)
+    rv_threshold = env_float("CHATGPT_RVOL_THRESHOLD", 1.5)
+
     status = "WAIT"
-    if confirm.close > up and rv >= threshold:
-        status = "LONG_CONFIRMED"
-    elif confirm.close < down and rv >= threshold:
-        status = "SHORT_CONFIRMED"
+    long_break = confirm.close > up and rv >= rv_threshold
+    short_break = confirm.close < down and rv >= rv_threshold
+    if long_break:
+        status = "LATE_LONG" if entry_cutoff_passed(now_et) else "LONG_CONFIRMED"
+    elif short_break:
+        status = "LATE_SHORT" if entry_cutoff_passed(now_et) else "SHORT_CONFIRMED"
     else:
-        pre = env_float("CHATGPT_PREALERT_PCT", 0.10) / 100.0
-        if up > 0 and 0 <= (up-observed)/up <= pre:
+        pre_pct = env_float("CHATGPT_PREALERT_PCT", 0.10) / 100.0
+        if up > 0 and 0 <= (up - observed) / up <= pre_pct:
             status = "NEAR_LONG"
-        elif down > 0 and 0 <= (observed-down)/down <= pre:
+        elif down > 0 and 0 <= (observed - down) / down <= pre_pct:
             status = "NEAR_SHORT"
-    return SignalSnapshot(symbol, mode, observed, confirm.dt.isoformat(), confirm.close, up, down, rv, e9, e21, a14, status)
+
+    return SignalSnapshot(
+        symbol=symbol, mode=mode, observed_price=observed,
+        completed_dt=confirm.dt.isoformat(), completed_close=confirm.close,
+        up_trigger=up, down_trigger=down, rel_volume=rv,
+        ema9=e9, ema21=e21, atr14=a14, status=status,
+    )
 
 
 def is_regular_session(now_et: datetime) -> bool:
     if now_et.weekday() >= 5:
         return False
-    return now_et.replace(hour=9, minute=30, second=0, microsecond=0) <= now_et < now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    open_t = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return open_t <= now_et < close_t
 
 
 def load_state(path: Path) -> dict:
@@ -256,135 +344,194 @@ def load_state(path: Path) -> dict:
 
 def save_state(path: Path, state: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(path)
+    temp = path.with_suffix(".tmp")
+    temp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temp.replace(path)
 
 
-def should_send(s: SignalSnapshot, state: dict, now_et: datetime) -> bool:
-    ss = state.setdefault("symbols", {}).setdefault(s.symbol, {})
-    if s.status in ("LONG_CONFIRMED", "SHORT_CONFIRMED"):
-        side = "LONG" if "LONG" in s.status else "SHORT"
-        level = s.up_trigger if side == "LONG" else s.down_trigger
-        key = f"{side}:{level:.4f}"
-        if ss.get("last_confirmed") == key:
+def trigger_key(s: SignalSnapshot) -> str:
+    side = "LONG" if "LONG" in s.status else "SHORT"
+    level = s.up_trigger if side == "LONG" else s.down_trigger
+    return f"{side}:{level:.4f}"
+
+
+def should_send(snapshot: SignalSnapshot, state: dict, now_et: datetime) -> bool:
+    symstate = state.setdefault("symbols", {}).setdefault(snapshot.symbol, {})
+    if snapshot.status in ("LONG_CONFIRMED", "SHORT_CONFIRMED", "LATE_LONG", "LATE_SHORT"):
+        key = trigger_key(snapshot)
+        if symstate.get("last_confirmed") == key:
             return False
-        ss["last_confirmed"], ss["last_confirmed_at"] = key, now_et.isoformat()
+        symstate["last_confirmed"] = key
+        symstate["last_confirmed_at"] = now_et.isoformat()
         return True
-    if s.status in ("NEAR_LONG", "NEAR_SHORT"):
-        side = "long" if s.status == "NEAR_LONG" else "short"
-        k = f"pre_{side}_at"
-        prior = ss.get(k)
+
+    if snapshot.status in ("NEAR_LONG", "NEAR_SHORT"):
+        side = "LONG" if snapshot.status == "NEAR_LONG" else "SHORT"
+        k = f"pre_{side.lower()}_at"
+        cooldown = env_int("CHATGPT_PREALERT_COOLDOWN_MIN", 10)
+        prior = symstate.get(k)
         if prior:
             try:
-                if now_et - datetime.fromisoformat(prior) < timedelta(minutes=env_int("CHATGPT_PREALERT_COOLDOWN_MIN", 10)):
+                dt = datetime.fromisoformat(prior)
+                if now_et - dt < timedelta(minutes=cooldown):
                     return False
             except ValueError:
                 pass
-        ss[k] = now_et.isoformat()
+        symstate[k] = now_et.isoformat()
         return True
-    if s.down_trigger <= s.completed_close <= s.up_trigger:
-        ss.pop("last_confirmed", None)
+
+    if snapshot.down_trigger <= snapshot.completed_close <= snapshot.up_trigger:
+        symstate.pop("last_confirmed", None)
     return False
 
 
 def format_alert(s: SignalSnapshot, now_et: datetime) -> str:
     if s.status == "LONG_CONFIRMED":
-        heading, action = f"🔴 {s.symbol} LONG BREAKOUT CONFIRMED", "Open IBKR and inspect the appropriate same-day option chain."
+        heading = f"🔴 {s.symbol} LONG BREAKOUT CONFIRMED"
+        action = "Open IBKR and inspect the appropriate same-day option chain."
     elif s.status == "SHORT_CONFIRMED":
-        heading, action = f"🔴 {s.symbol} SHORT BREAKOUT CONFIRMED", "Open IBKR and inspect the appropriate same-day option chain."
+        heading = f"🔴 {s.symbol} SHORT BREAKOUT CONFIRMED"
+        action = "Open IBKR and inspect the appropriate same-day option chain."
+    elif s.status == "LATE_LONG":
+        heading = f"🟠 {s.symbol} LATE LONG BREAKOUT"
+        action = "After the 15:30 ET entry cutoff — informational only; do not treat as a new 0DTE entry signal."
+    elif s.status == "LATE_SHORT":
+        heading = f"🟠 {s.symbol} LATE SHORT BREAKOUT"
+        action = "After the 15:30 ET entry cutoff — informational only; do not treat as a new 0DTE entry signal."
     elif s.status == "NEAR_LONG":
-        heading, action = f"🟡 {s.symbol} NEAR UPSIDE TRIGGER", "NO CONFIRMED SIGNAL YET"
+        heading = f"🟡 {s.symbol} NEAR UPSIDE TRIGGER"
+        action = "NO CONFIRMED SIGNAL YET"
     else:
-        heading, action = f"🟡 {s.symbol} NEAR DOWNSIDE TRIGGER", "NO CONFIRMED SIGNAL YET"
-    return (f"{heading}\n\nObserved: {s.observed_price:.2f}\n1m close: {s.completed_close:.2f}\nUp/Down: {s.up_trigger:.2f} / {s.down_trigger:.2f}\nRelative volume: {s.rel_volume:.2f}x\nEMA9/EMA21: {s.ema9:.2f} / {s.ema21:.2f}\nATR14: {s.atr14:.2f}\nMode: {s.mode}\nTime: {now_et.strftime('%H:%M:%S ET')}\n\n{action}")
+        heading = f"🟡 {s.symbol} NEAR DOWNSIDE TRIGGER"
+        action = "NO CONFIRMED SIGNAL YET"
+
+    return (
+        f"{heading}\n\n"
+        f"Observed: {s.observed_price:.2f}\n"
+        f"5m close: {s.completed_close:.2f}\n"
+        f"Up/Down: {s.up_trigger:.2f} / {s.down_trigger:.2f}\n"
+        f"Relative volume: {s.rel_volume:.2f}x\n"
+        f"EMA9/EMA21: {s.ema9:.2f} / {s.ema21:.2f}\n"
+        f"ATR14: {s.atr14:.2f}\n"
+        f"Mode: {s.mode}\n"
+        f"Time: {now_et.strftime('%H:%M:%S ET')}\n\n"
+        f"{action}"
+    )
 
 
-def setup_logging(path: Path) -> logging.Logger:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    log = logging.getLogger("chatgpt_trigger_monitor")
-    log.setLevel(logging.INFO)
-    if not log.handlers:
-        for h in (logging.FileHandler(path), logging.StreamHandler(sys.stdout)):
-            h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            log.addHandler(h)
-    return log
+def setup_logging(log_path: Path) -> logging.Logger:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("chatgpt_trigger_monitor")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_path)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(fh)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        logger.addHandler(sh)
+    return logger
 
 
 def symbols_from_env() -> List[str]:
-    return [x.strip().upper() for x in os.getenv("CHATGPT_MONITOR_SYMBOLS", "TSLA,MSTR").split(",") if x.strip()]
+    raw = os.getenv("CHATGPT_MONITOR_SYMBOLS", "TSLA,MSTR")
+    return [x.strip().upper() for x in raw.split(",") if x.strip()]
 
 
-def scan_once(client, telegram, state, logger, send_alerts=True, now_et=None):
+def scan_once(client: TwelveDataClient, telegram: TelegramClient, state: dict,
+              logger: logging.Logger, send_alerts: bool = True,
+              now_et: Optional[datetime] = None) -> List[SignalSnapshot]:
     now_et = now_et or datetime.now(ET)
-    snaps = []
+    snapshots: List[SignalSnapshot] = []
     for symbol in symbols_from_env():
         try:
-            snap = derive_snapshot(symbol, client.time_series(symbol, max(50, env_int("CHATGPT_OUTPUTSIZE", 50))), now_et)
-            snaps.append(snap)
-            logger.info("%s price=%.2f close=%.2f up=%.2f down=%.2f rv=%.2f status=%s mode=%s", symbol, snap.observed_price, snap.completed_close, snap.up_trigger, snap.down_trigger, snap.rel_volume, snap.status, snap.mode)
+            bars = client.time_series(symbol, outputsize=max(150, env_int("CHATGPT_OUTPUTSIZE", 150)))
+            snap = derive_snapshot(symbol, bars, now_et)
+            snapshots.append(snap)
+            logger.info(
+                "%s price=%.2f close=%.2f up=%.2f down=%.2f rv=%.2f status=%s mode=%s",
+                symbol, snap.observed_price, snap.completed_close, snap.up_trigger,
+                snap.down_trigger, snap.rel_volume, snap.status, snap.mode,
+            )
             if send_alerts and should_send(snap, state, now_et):
                 telegram.send(format_alert(snap, now_et))
                 logger.warning("ALERT %s %s", symbol, snap.status)
         except Exception as e:
             logger.error("%s scan failed: %s", symbol, str(e))
     state["last_check"] = now_et.isoformat()
-    return snaps
+    return snapshots
+
+
+def status_report(state_path: Path) -> str:
+    state = load_state(state_path)
+    now = datetime.now(ET)
+    td = bool(os.getenv("TWELVEDATA_API_KEY"))
+    tg = bool(os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+    lines = [
+        "ChatGPT Trigger Monitor",
+        f"market: {'open' if is_regular_session(now) else 'closed'}",
+        f"time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}",
+        f"last check: {state.get('last_check') or 'never'}",
+        f"symbols: {','.join(symbols_from_env())}",
+        f"Twelve Data key: {'configured' if td else 'missing'}",
+        f"Telegram: {'configured' if tg else 'missing'}",
+    ]
+    return "\n".join(lines)
 
 
 def sleep_until_next_minute() -> None:
     now = datetime.now(ET)
     nxt = (now + timedelta(minutes=1)).replace(second=3, microsecond=0)
-    time.sleep(max(1.0, (nxt-now).total_seconds()))
+    time.sleep(max(1.0, (nxt - now).total_seconds()))
 
 
 def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--once", action="store_true")
-    p.add_argument("--status", action="store_true")
-    p.add_argument("--test-telegram", action="store_true")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--no-alerts", action="store_true")
-    a = p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--once", action="store_true", help="run one market scan")
+    parser.add_argument("--status", action="store_true", help="show local configuration/status")
+    parser.add_argument("--test-telegram", action="store_true", help="send one clearly marked Telegram test")
+    parser.add_argument("--force", action="store_true", help="allow --once outside RTH")
+    parser.add_argument("--no-alerts", action="store_true", help="scan/log without sending alerts")
+    args = parser.parse_args()
+
     state_path = Path(os.getenv("CHATGPT_STATE_FILE", str(DEFAULT_STATE)))
-    log = setup_logging(Path(os.getenv("CHATGPT_LOG_FILE", str(DEFAULT_LOG))))
-    if a.status:
-        now = datetime.now(ET)
-        state = load_state(state_path)
-        print("ChatGPT Trigger Monitor")
-        print(f"market: {'open' if is_regular_session(now) else 'closed'}")
-        print(f"time: {now.strftime('%Y-%m-%d %H:%M:%S ET')}")
-        print(f"last check: {state.get('last_check') or 'never'}")
-        print(f"symbols: {','.join(symbols_from_env())}")
-        print(f"Twelve Data key: {'configured' if os.getenv('TWELVEDATA_API_KEY') else 'missing'}")
-        print(f"Telegram: {'configured' if os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID') else 'missing'}")
+    log_path = Path(os.getenv("CHATGPT_LOG_FILE", str(DEFAULT_LOG)))
+    logger = setup_logging(log_path)
+
+    if args.status:
+        print(status_report(state_path))
         return 0
-    key = os.getenv("TWELVEDATA_API_KEY")
-    if not key:
+
+    api_key = os.getenv("TWELVEDATA_API_KEY")
+    if not api_key:
         print("TWELVEDATA_API_KEY is missing", file=sys.stderr)
         return 2
-    tg = TelegramClient(os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"))
-    td = TwelveDataClient(key)
-    if a.test_telegram:
-        tg.send("🧪 TEST — ChatGPT QCC trigger monitor Telegram delivery is working. No trade signal.")
+    telegram = TelegramClient(os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"))
+    client = TwelveDataClient(api_key)
+
+    if args.test_telegram:
+        telegram.send("🧪 TEST — ChatGPT QCC trigger monitor Telegram delivery is working. No trade signal.")
         print("Telegram test sent")
         return 0
+
     state = load_state(state_path)
-    if a.once:
+
+    if args.once:
         now = datetime.now(ET)
-        if not a.force and not is_regular_session(now):
-            print("Market outside U.S. regular hours; use --force to test anyway.")
+        if not args.force and not is_regular_session(now):
+            print("Market is outside U.S. regular hours; use --force to test anyway.")
             return 0
-        snaps = scan_once(td, tg, state, log, not a.no_alerts, now)
+        snaps = scan_once(client, telegram, state, logger, send_alerts=not args.no_alerts, now_et=now)
         save_state(state_path, state)
         for s in snaps:
             print(json.dumps(asdict(s), sort_keys=True))
         return 0 if snaps else 1
-    log.info("monitor starting symbols=%s", ",".join(symbols_from_env()))
+
+    logger.info("monitor starting symbols=%s", ",".join(symbols_from_env()))
     while True:
         now = datetime.now(ET)
         if is_regular_session(now):
-            scan_once(td, tg, state, log, True, now)
+            scan_once(client, telegram, state, logger, send_alerts=True, now_et=now)
             save_state(state_path, state)
             sleep_until_next_minute()
         else:
