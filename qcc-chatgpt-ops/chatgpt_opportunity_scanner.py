@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Quota-aware QCC opportunity scanner.
 
-Uses the existing ChatGPT 5-minute trigger engine but adds a two-speed universe
+Uses the existing ChatGPT 5-minute trigger engine but adds a quota-aware universe
 scheduler:
-  * full universe scan every 10 minutes
+  * full 14-symbol universe scan every 20 minutes
   * rank candidates
   * top candidate every minute
   * runner-up every 5 minutes
@@ -14,19 +14,19 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 import chatgpt_trigger_monitor as core
 
 ET = core.ET
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SELECTION = PROJECT_ROOT / "logs" / "chatgpt_opportunity_selection.json"
+DEFAULT_UNIVERSE = "SPY,QQQ,TSLA,NVDA,MSTR,AVGO,AMD,META,AMZN,AAPL,GOOGL,MSFT,PLTR,COIN"
 
 
 @dataclass
@@ -39,7 +39,7 @@ class RankedCandidate:
 
 
 def universe_from_env() -> List[str]:
-    raw = os.getenv("CHATGPT_UNIVERSE_SYMBOLS", "TSLA,MSTR,NVDA,AVGO,SPY,QQQ")
+    raw = os.getenv("CHATGPT_UNIVERSE_SYMBOLS", DEFAULT_UNIVERSE)
     out = []
     for item in raw.split(","):
         s = item.strip().upper()
@@ -48,12 +48,16 @@ def universe_from_env() -> List[str]:
     return out
 
 
-def rank_snapshot(s: core.SignalSnapshot) -> RankedCandidate:
-    """Rank opportunity quality from stock-only information.
+def trading_telegram() -> core.TelegramClient:
+    """Dedicated trading alert channel only; never fall back to Jarvis credentials."""
+    return core.TelegramClient(
+        os.getenv("QCC_TRADING_TELEGRAM_BOT_TOKEN"),
+        os.getenv("QCC_TRADING_TELEGRAM_CHAT_ID"),
+    )
 
-    This is intentionally not an option-selection score. It asks which underlying
-    is most worth watching for a confirmed directional move.
-    """
+
+def rank_snapshot(s: core.SignalSnapshot) -> RankedCandidate:
+    """Rank opportunity quality from stock-only information."""
     atr = max(s.atr14, 1e-9)
     up_dist_atr = max(0.0, s.up_trigger - s.observed_price) / atr
     dn_dist_atr = max(0.0, s.observed_price - s.down_trigger) / atr
@@ -105,8 +109,11 @@ def scan_symbols(symbols: List[str], client: core.TwelveDataClient,
                 snap.down_trigger, snap.rel_volume, snap.status,
             )
             if send_alerts and core.should_send(snap, state, now_et):
-                telegram.send(core.format_alert(snap, now_et))
-                logger.warning("ALERT %s %s", symbol, snap.status)
+                if telegram.configured:
+                    telegram.send(core.format_alert(snap, now_et))
+                    logger.warning("ALERT %s %s", symbol, snap.status)
+                else:
+                    logger.warning("ALERT SUPPRESSED %s %s dedicated trading Telegram not configured", symbol, snap.status)
         except Exception as e:
             logger.error("SCAN %s failed: %s", symbol, str(e))
     ranked.sort(key=lambda x: x.score, reverse=True)
@@ -142,7 +149,7 @@ def load_selection(path: Path) -> List[str]:
 
 
 def due_full_scan(now_et: datetime, state: dict) -> bool:
-    every = max(5, core.env_int("CHATGPT_UNIVERSE_SCAN_MIN", 10))
+    every = max(10, core.env_int("CHATGPT_UNIVERSE_SCAN_MIN", 20))
     raw = state.get("last_universe_scan")
     if not raw:
         return True
@@ -174,7 +181,7 @@ def send_ranking_if_changed(ranked: List[RankedCandidate], telegram: core.Telegr
     if state.get("ranking_signature") == signature:
         return
     state["ranking_signature"] = signature
-    lines = ["📊 QCC WATCHLIST UPDATED", ""]
+    lines = ["📊 QCC TRADING WATCHLIST UPDATED", ""]
     for idx, c in enumerate(top, 1):
         lines.append(f"#{idx} {c.symbol} {c.bias} — score {c.score:.1f}")
         lines.append(f"   {c.reason}")
@@ -213,15 +220,17 @@ def main() -> int:
         print(core.status_report(state_path))
         print(f"universe: {','.join(universe_from_env())}")
         print(f"selected: {','.join(load_selection(selection_path)[:2]) or 'none'}")
-        print(f"universe cadence: {core.env_int('CHATGPT_UNIVERSE_SCAN_MIN', 10)}m")
+        print(f"universe cadence: {core.env_int('CHATGPT_UNIVERSE_SCAN_MIN', 20)}m")
         print(f"runner cadence: {core.env_int('CHATGPT_RUNNER_SCAN_MIN', 5)}m")
+        tg = trading_telegram()
+        print(f"dedicated trading Telegram: {'configured' if tg.configured else 'missing'}")
         return 0
 
     api_key = os.getenv("TWELVEDATA_API_KEY")
     if not api_key:
         raise SystemExit("TWELVEDATA_API_KEY is missing")
     client = core.TwelveDataClient(api_key)
-    telegram = core.TelegramClient(os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID"))
+    telegram = trading_telegram()
 
     if a.once:
         now = datetime.now(ET)
