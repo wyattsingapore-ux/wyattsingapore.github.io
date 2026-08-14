@@ -12,8 +12,13 @@ class OpportunityScannerTests(unittest.TestCase):
             "CHATGPT_UNIVERSE_SYMBOLS",
             "CHATGPT_UNIVERSE_SCAN_MIN",
             "CHATGPT_RUNNER_SCAN_MIN",
+            "QCC_SCANNER_UNIVERSE_SYMBOLS",
+            "QCC_SCANNER_UNIVERSE_SCAN_MIN",
+            "QCC_SCANNER_RUNNER_SCAN_MIN",
             "QCC_TRADING_TELEGRAM_BOT_TOKEN",
             "QCC_TRADING_TELEGRAM_CHAT_ID",
+            "TELEGRAM_BOT_TOKEN",
+            "TELEGRAM_CHAT_ID",
         ]:
             os.environ.pop(key, None)
 
@@ -30,11 +35,24 @@ class OpportunityScannerTests(unittest.TestCase):
         expected = ["SPY","QQQ","TSLA","NVDA","MSTR","AVGO","AMD","META","AMZN","AAPL","GOOGL","MSFT","PLTR","COIN"]
         self.assertEqual(scan.universe_from_env(), expected)
 
+    def test_stale_v1_env_does_not_override_scanner_profile(self):
+        os.environ["CHATGPT_UNIVERSE_SYMBOLS"] = "TSLA,MSTR,NVDA,AVGO,SPY,QQQ"
+        os.environ["CHATGPT_UNIVERSE_SCAN_MIN"] = "10"
+        self.assertEqual(len(scan.universe_from_env()), 14)
+        self.assertEqual(scan.universe_scan_minutes(), 20)
+
+    def test_scanner_specific_env_can_override_profile(self):
+        os.environ["QCC_SCANNER_UNIVERSE_SYMBOLS"] = "SPY,QQQ,TSLA"
+        os.environ["QCC_SCANNER_UNIVERSE_SCAN_MIN"] = "30"
+        os.environ["QCC_SCANNER_RUNNER_SCAN_MIN"] = "7"
+        self.assertEqual(scan.universe_from_env(), ["SPY","QQQ","TSLA"])
+        self.assertEqual(scan.universe_scan_minutes(), 30)
+        self.assertEqual(scan.runner_scan_minutes(), 7)
+
     def test_dedicated_telegram_does_not_fall_back_to_jarvis(self):
         os.environ["TELEGRAM_BOT_TOKEN"] = "jarvis-token"
         os.environ["TELEGRAM_CHAT_ID"] = "jarvis-chat"
-        tg = scan.trading_telegram()
-        self.assertFalse(tg.configured)
+        self.assertFalse(scan.trading_telegram().configured)
         os.environ["QCC_TRADING_TELEGRAM_BOT_TOKEN"] = "trading-token"
         os.environ["QCC_TRADING_TELEGRAM_CHAT_ID"] = "trading-chat"
         self.assertTrue(scan.trading_telegram().configured)
