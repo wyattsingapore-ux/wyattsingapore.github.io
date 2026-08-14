@@ -27,6 +27,8 @@ ET = core.ET
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_SELECTION = PROJECT_ROOT / "logs" / "chatgpt_opportunity_selection.json"
 DEFAULT_UNIVERSE = "SPY,QQQ,TSLA,NVDA,MSTR,AVGO,AMD,META,AMZN,AAPL,GOOGL,MSFT,PLTR,COIN"
+DEFAULT_UNIVERSE_SCAN_MIN = 20
+DEFAULT_RUNNER_SCAN_MIN = 5
 
 
 @dataclass
@@ -39,13 +41,23 @@ class RankedCandidate:
 
 
 def universe_from_env() -> List[str]:
-    raw = os.getenv("CHATGPT_UNIVERSE_SYMBOLS", DEFAULT_UNIVERSE)
+    # Scanner v2 deliberately uses its own namespace so stale v1 CHATGPT_* values
+    # in the shared Oracle env file cannot silently shrink the production universe.
+    raw = os.getenv("QCC_SCANNER_UNIVERSE_SYMBOLS", DEFAULT_UNIVERSE)
     out = []
     for item in raw.split(","):
         s = item.strip().upper()
         if s and s not in out:
             out.append(s)
     return out
+
+
+def universe_scan_minutes() -> int:
+    return max(10, core.env_int("QCC_SCANNER_UNIVERSE_SCAN_MIN", DEFAULT_UNIVERSE_SCAN_MIN))
+
+
+def runner_scan_minutes() -> int:
+    return max(2, core.env_int("QCC_SCANNER_RUNNER_SCAN_MIN", DEFAULT_RUNNER_SCAN_MIN))
 
 
 def trading_telegram() -> core.TelegramClient:
@@ -149,7 +161,7 @@ def load_selection(path: Path) -> List[str]:
 
 
 def due_full_scan(now_et: datetime, state: dict) -> bool:
-    every = max(10, core.env_int("CHATGPT_UNIVERSE_SCAN_MIN", 20))
+    every = universe_scan_minutes()
     raw = state.get("last_universe_scan")
     if not raw:
         return True
@@ -161,7 +173,7 @@ def due_full_scan(now_et: datetime, state: dict) -> bool:
 
 
 def due_runner_scan(now_et: datetime, state: dict) -> bool:
-    every = max(2, core.env_int("CHATGPT_RUNNER_SCAN_MIN", 5))
+    every = runner_scan_minutes()
     raw = state.get("last_runner_scan")
     if not raw:
         return True
@@ -220,8 +232,8 @@ def main() -> int:
         print(core.status_report(state_path))
         print(f"universe: {','.join(universe_from_env())}")
         print(f"selected: {','.join(load_selection(selection_path)[:2]) or 'none'}")
-        print(f"universe cadence: {core.env_int('CHATGPT_UNIVERSE_SCAN_MIN', 20)}m")
-        print(f"runner cadence: {core.env_int('CHATGPT_RUNNER_SCAN_MIN', 5)}m")
+        print(f"universe cadence: {universe_scan_minutes()}m")
+        print(f"runner cadence: {runner_scan_minutes()}m")
         tg = trading_telegram()
         print(f"dedicated trading Telegram: {'configured' if tg.configured else 'missing'}")
         return 0
