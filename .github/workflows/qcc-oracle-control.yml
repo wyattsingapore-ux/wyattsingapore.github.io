@@ -38,12 +38,8 @@ jobs:
             git -C /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops status --short -- qcc-control-mcp/ops_dispatch.py
           elif [ "$cmd" = "inspect-alert-code" ]; then
             f=/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/chatgpt_trigger_monitor.py
-            echo "=== FILE ==="
-            echo "$f"
-            echo "=== ALERT/TELEGRAM REFERENCES ==="
-            grep -n -E 'telegram|Telegram|send_message|sendPhoto|alert|ALERT|format' "$f" | head -n 200 || true
-            echo "=== FUNCTION HEADERS ==="
-            grep -n -E '^def |^class ' "$f" | head -n 200 || true
+            echo "=== ALERT FORMAT SOURCE ==="
+            sed -n '270,421p' "$f"
           else
             /usr/bin/python3 /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/ops_dispatch.py "$cmd"
           fi
