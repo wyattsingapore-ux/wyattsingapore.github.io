@@ -21,9 +21,9 @@ jobs:
           set -euo pipefail
           cmd="$(curl -fsSL -H 'Accept: application/vnd.github.raw+json' "https://api.github.com/repos/wyattsingapore-ux/wyattsingapore.github.io/contents/qcc-control-command.txt?ref=${GITHUB_SHA}" | tr -d '\r\n')"
           case "$cmd" in
-            status|trigger-logs|opportunity-logs|mcp-logs|tests|scanner-status|scanner-smoke|pull-ops|install-opportunity|restart-trigger|restart-opportunity|restart-mcp|stop-trigger|dispatcher-diff|dispatcher-clean-mode) ;;
+            status|trigger-logs|opportunity-logs|mcp-logs|tests|scanner-status|scanner-smoke|pull-ops|install-opportunity|restart-trigger|restart-opportunity|restart-mcp|stop-trigger|dispatcher-diff|dispatcher-clean-mode|inspect-alert-code) ;;
             *) echo "Rejected command: $cmd" >&2; exit 64 ;;
-          esac
+            esac
           echo "command=$cmd" >> "$GITHUB_OUTPUT"
       - name: Execute restricted Oracle dispatcher
         shell: bash
@@ -36,6 +36,14 @@ jobs:
           elif [ "$cmd" = "dispatcher-clean-mode" ]; then
             chmod 0644 /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/ops_dispatch.py
             git -C /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops status --short -- qcc-control-mcp/ops_dispatch.py
+          elif [ "$cmd" = "inspect-alert-code" ]; then
+            f=/home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/chatgpt_trigger_monitor.py
+            echo "=== FILE ==="
+            echo "$f"
+            echo "=== ALERT/TELEGRAM REFERENCES ==="
+            grep -n -E 'telegram|Telegram|send_message|sendPhoto|alert|ALERT|format' "$f" | head -n 200 || true
+            echo "=== FUNCTION HEADERS ==="
+            grep -n -E '^def |^class ' "$f" | head -n 200 || true
           else
             /usr/bin/python3 /home/ubuntu/openclaw_workspace/qcc-chatgpt-ops/qcc-control-mcp/ops_dispatch.py "$cmd"
           fi
