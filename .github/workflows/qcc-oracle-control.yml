@@ -5,6 +5,7 @@ on:
     branches: [qcc-chatgpt-ops]
     paths:
       - qcc-control-command.txt
+      - .github/workflows/qcc-oracle-control.yml
 
 permissions:
   contents: read
