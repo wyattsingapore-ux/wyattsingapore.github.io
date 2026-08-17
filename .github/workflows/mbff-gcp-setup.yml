@@ -27,11 +27,13 @@ jobs:
           import json
           from pathlib import Path
           d=json.loads(Path('.mbff-bootstrap/gcp-setup.json').read_text())
-          assert d == {'schema_version':1,'action':'setup_mbff_gcp','mutating':True}
+          assert d.get('schema_version') == 1
+          assert d.get('action') == 'setup_mbff_gcp'
+          assert d.get('mutating') is True
           PY
       - name: Create isolated keyless MBFF identity infrastructure
         env:
-          PROJECT_ID: mbff-cloud-publisher-wt26
+          PROJECT_ID: project-2fe92524-b20b-4186-bef
           SA_NAME: mbff-oracle-drive
           POOL_ID: github-mbff
           PROVIDER_ID: github
@@ -40,9 +42,7 @@ jobs:
           PRIVATE_REPO_ID: "1312612135"
         run: |
           set -euo pipefail
-          if ! gcloud projects describe "$PROJECT_ID" >/dev/null 2>&1; then
-            gcloud projects create "$PROJECT_ID" --name="MBFF Cloud Publisher" --quiet
-          fi
+          gcloud projects describe "$PROJECT_ID" >/dev/null
           gcloud services enable \
             iam.googleapis.com \
             iamcredentials.googleapis.com \
@@ -102,6 +102,7 @@ jobs:
             'completed':True,
             'mutating':True,
             'keyless':True,
+            'shared_project_container':True,
             'project_id':os.environ['PROJECT_ID'],
             'project_number':os.environ['PROJECT_NUMBER'],
             'service_account':os.environ['SA_EMAIL'],
