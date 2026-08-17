@@ -15,7 +15,7 @@ concurrency:
 jobs:
   bootstrap:
     runs-on: self-hosted
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -30,9 +30,13 @@ jobs:
           from pathlib import Path
           data=json.loads(Path('.mbff-bootstrap/request.json').read_text())
           assert data.get('schema_version') == 1
-          assert data.get('mutating') is False
           action=data.get('action')
-          assert action in {'probe','repo_access_probe','drive_access_probe'}
+          allowed={'probe','repo_access_probe','drive_access_probe','setup_worker'}
+          assert action in allowed
+          if action == 'setup_worker':
+              assert data.get('mutating') is True
+          else:
+              assert data.get('mutating') is False
           print(f'action={action}')
           PY
 
@@ -45,16 +49,7 @@ jobs:
           import json, os, platform
           from datetime import datetime, timezone
           from pathlib import Path
-          payload={
-            'schema_version':1,
-            'action':'probe',
-            'completed':True,
-            'mutating':False,
-            'hostname':platform.node(),
-            'user':os.environ.get('USER',''),
-            'machine':platform.machine(),
-            'checked_at':datetime.now(timezone.utc).isoformat(),
-          }
+          payload={'schema_version':1,'action':'probe','completed':True,'mutating':False,'hostname':platform.node(),'user':os.environ.get('USER',''),'machine':platform.machine(),'checked_at':datetime.now(timezone.utc).isoformat()}
           Path('.mbff-bootstrap/results/probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
           PY
 
@@ -64,23 +59,14 @@ jobs:
           set -euo pipefail
           mkdir -p .mbff-bootstrap/results
           export GIT_TERMINAL_PROMPT=0
-          https_ok=false
-          ssh_ok=false
+          https_ok=false; ssh_ok=false
           if timeout 15 git ls-remote https://github.com/wyattsingapore-ux/MindBendingFunFact.git HEAD >/tmp/mbff-https.out 2>/tmp/mbff-https.err; then https_ok=true; fi
           if timeout 15 git ls-remote git@github.com:wyattsingapore-ux/MindBendingFunFact.git HEAD >/tmp/mbff-ssh.out 2>/tmp/mbff-ssh.err; then ssh_ok=true; fi
           HTTPS_OK="$https_ok" SSH_OK="$ssh_ok" python3 - <<'PY'
           import json, os
           from datetime import datetime, timezone
           from pathlib import Path
-          payload={
-            'schema_version':1,
-            'action':'repo_access_probe',
-            'completed':True,
-            'mutating':False,
-            'https_private_repo_access':os.environ['HTTPS_OK']=='true',
-            'ssh_private_repo_access':os.environ['SSH_OK']=='true',
-            'checked_at':datetime.now(timezone.utc).isoformat(),
-          }
+          payload={'schema_version':1,'action':'repo_access_probe','completed':True,'mutating':False,'https_private_repo_access':os.environ['HTTPS_OK']=='true','ssh_private_repo_access':os.environ['SSH_OK']=='true','checked_at':datetime.now(timezone.utc).isoformat()}
           Path('.mbff-bootstrap/results/repo-access-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
           PY
 
@@ -105,20 +91,60 @@ jobs:
           from pathlib import Path
           rows=[]
           for line in Path('/tmp/mbff-rclone-access.txt').read_text().splitlines():
-              if not line.strip():
-                  continue
-              remote, ok = line.split('\t', 1)
-              rows.append({'remote':remote,'mbff_folder_access':ok=='true'})
+              if line.strip():
+                  remote, ok=line.split('\t',1); rows.append({'remote':remote,'mbff_folder_access':ok=='true'})
+          payload={'schema_version':1,'action':'drive_access_probe','completed':True,'mutating':False,'remotes':rows,'any_mbff_folder_access':any(x['mbff_folder_access'] for x in rows),'checked_at':datetime.now(timezone.utc).isoformat()}
+          Path('.mbff-bootstrap/results/drive-access-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Provision isolated headless NotebookLM worker
+        if: steps.request.outputs.action == 'setup_worker'
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/mbff-notebooklm-worker"
+          umask 077
+          mkdir -p "$ROOT" "$ROOT/auth" "$ROOT/state" "$ROOT/downloads" "$ROOT/logs" "$ROOT/run" "$ROOT/bin"
+          chmod 700 "$ROOT" "$ROOT/auth" "$ROOT/state" "$ROOT/run"
+          if [ ! -x "$ROOT/.venv/bin/python" ]; then
+            python3 -m venv "$ROOT/.venv"
+          fi
+          "$ROOT/.venv/bin/python" -m pip install --upgrade pip wheel >/tmp/mbff-pip-bootstrap.log 2>&1
+          "$ROOT/.venv/bin/python" -m pip install 'notebooklm-py==0.3.4' >/tmp/mbff-pip-install.log 2>&1
+          cat > "$ROOT/bin/notebooklm" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          ROOT="$HOME/mbff-notebooklm-worker"
+          export NOTEBOOKLM_HOME="$ROOT/auth"
+          umask 077
+          exec "$ROOT/.venv/bin/notebooklm" --storage "$ROOT/auth/storage_state.json" "$@"
+          SH
+          chmod 700 "$ROOT/bin/notebooklm"
+          cat > "$ROOT/bin/auth-check" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec "$HOME/mbff-notebooklm-worker/bin/notebooklm" auth check --test --json
+          SH
+          chmod 700 "$ROOT/bin/auth-check"
+          VERSION="$($ROOT/bin/notebooklm --version 2>&1)"
+          mkdir -p .mbff-bootstrap/results
+          ROOT="$ROOT" VERSION="$VERSION" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          root=Path(os.environ['ROOT'])
           payload={
             'schema_version':1,
-            'action':'drive_access_probe',
+            'action':'setup_worker',
             'completed':True,
-            'mutating':False,
-            'remotes':rows,
-            'any_mbff_folder_access':any(x['mbff_folder_access'] for x in rows),
+            'mutating':True,
+            'worker_root':str(root),
+            'version':os.environ['VERSION'],
+            'auth_file_present':(root/'auth/storage_state.json').is_file(),
+            'venv_present':(root/'.venv/bin/python').is_file(),
+            'wrapper_present':(root/'bin/notebooklm').is_file(),
             'checked_at':datetime.now(timezone.utc).isoformat(),
           }
-          Path('.mbff-bootstrap/results/drive-access-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          Path('.mbff-bootstrap/results/setup-worker.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
           PY
 
       - name: Commit sanitized result
