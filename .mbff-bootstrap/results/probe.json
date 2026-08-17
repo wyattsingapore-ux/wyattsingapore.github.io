@@ -1,0 +1,10 @@
+{
+  "action": "probe",
+  "checked_at": "2026-08-17T18:39:55.638011+00:00",
+  "completed": true,
+  "hostname": "instance-20260211-2148",
+  "machine": "aarch64",
+  "mutating": false,
+  "schema_version": 1,
+  "user": "ubuntu"
+}
