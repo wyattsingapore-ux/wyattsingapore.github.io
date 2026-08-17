@@ -19,21 +19,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify exact Oracle host
+      - name: Verify exact Oracle host and request
+        id: request
         run: |
           set -euo pipefail
           test "$(hostname)" = "instance-20260211-2148"
           test "$(whoami)" = "ubuntu"
-          python3 - <<'PY'
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           from pathlib import Path
           data=json.loads(Path('.mbff-bootstrap/request.json').read_text())
           assert data.get('schema_version') == 1
           assert data.get('mutating') is False
-          assert data.get('action') == 'probe'
+          action=data.get('action')
+          assert action in {'probe','repo_access_probe'}
+          print(f'action={action}')
           PY
 
-      - name: Write sanitized bootstrap proof
+      - name: Basic bootstrap proof
+        if: steps.request.outputs.action == 'probe'
         run: |
           set -euo pipefail
           mkdir -p .mbff-bootstrap/results
@@ -54,13 +58,39 @@ jobs:
           Path('.mbff-bootstrap/results/probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
           PY
 
-      - name: Commit proof
+      - name: Probe private MBFF repo access without prompting
+        if: steps.request.outputs.action == 'repo_access_probe'
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-bootstrap/results
+          export GIT_TERMINAL_PROMPT=0
+          https_ok=false
+          ssh_ok=false
+          if timeout 15 git ls-remote https://github.com/wyattsingapore-ux/MindBendingFunFact.git HEAD >/tmp/mbff-https.out 2>/tmp/mbff-https.err; then https_ok=true; fi
+          if timeout 15 git ls-remote git@github.com:wyattsingapore-ux/MindBendingFunFact.git HEAD >/tmp/mbff-ssh.out 2>/tmp/mbff-ssh.err; then ssh_ok=true; fi
+          HTTPS_OK="$https_ok" SSH_OK="$ssh_ok" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          payload={
+            'schema_version':1,
+            'action':'repo_access_probe',
+            'completed':True,
+            'mutating':False,
+            'https_private_repo_access':os.environ['HTTPS_OK']=='true',
+            'ssh_private_repo_access':os.environ['SSH_OK']=='true',
+            'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-bootstrap/results/repo-access-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Commit sanitized result
         run: |
           set -euo pipefail
           git config user.name "mbff-oracle-bootstrap"
           git config user.email "actions@users.noreply.github.com"
-          git add .mbff-bootstrap/results/probe.json
+          git add .mbff-bootstrap/results/*.json
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m "Record MBFF Oracle bootstrap probe"
+          git commit -m "Record MBFF Oracle bootstrap result"
           git pull --rebase origin main
           git push origin HEAD:main
