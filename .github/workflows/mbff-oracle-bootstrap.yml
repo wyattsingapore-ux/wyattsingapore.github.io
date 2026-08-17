@@ -32,7 +32,7 @@ jobs:
           assert data.get('schema_version') == 1
           assert data.get('mutating') is False
           action=data.get('action')
-          assert action in {'probe','repo_access_probe'}
+          assert action in {'probe','repo_access_probe','drive_access_probe'}
           print(f'action={action}')
           PY
 
@@ -82,6 +82,43 @@ jobs:
             'checked_at':datetime.now(timezone.utc).isoformat(),
           }
           Path('.mbff-bootstrap/results/repo-access-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Probe existing rclone access to MBFF Drive folder
+        if: steps.request.outputs.action == 'drive_access_probe'
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-bootstrap/results
+          command -v rclone >/dev/null 2>&1
+          rclone listremotes > /tmp/mbff-rclone-remotes.txt
+          TARGET='AI Projects and Commercialisation/Youtube - Music/NotebookLM Video/Mind Bending Fun Fact'
+          : > /tmp/mbff-rclone-access.txt
+          while IFS= read -r remote; do
+            [ -n "$remote" ] || continue
+            ok=false
+            if timeout 30 rclone lsf "${remote}${TARGET}" --max-depth 1 >/tmp/mbff-rclone-lsf.txt 2>/tmp/mbff-rclone-err.txt; then ok=true; fi
+            printf '%s\t%s\n' "$remote" "$ok" >> /tmp/mbff-rclone-access.txt
+          done < /tmp/mbff-rclone-remotes.txt
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          rows=[]
+          for line in Path('/tmp/mbff-rclone-access.txt').read_text().splitlines():
+              if not line.strip():
+                  continue
+              remote, ok = line.split('\t', 1)
+              rows.append({'remote':remote,'mbff_folder_access':ok=='true'})
+          payload={
+            'schema_version':1,
+            'action':'drive_access_probe',
+            'completed':True,
+            'mutating':False,
+            'remotes':rows,
+            'any_mbff_folder_access':any(x['mbff_folder_access'] for x in rows),
+            'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-bootstrap/results/drive-access-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
           PY
 
       - name: Commit sanitized result
