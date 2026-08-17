@@ -1,0 +1,12 @@
+{
+  "action": "setup_worker",
+  "auth_file_present": false,
+  "checked_at": "2026-08-17T20:11:15.174827+00:00",
+  "completed": true,
+  "mutating": true,
+  "schema_version": 1,
+  "venv_present": true,
+  "version": "NotebookLM CLI, version 0.3.4",
+  "worker_root": "/home/ubuntu/mbff-notebooklm-worker",
+  "wrapper_present": true
+}
