@@ -1,0 +1,14 @@
+{
+  "active_auth": true,
+  "checked_at": "2026-08-17T20:34:36.850522+00:00",
+  "completed": true,
+  "gcloud_installed": true,
+  "mutating": false,
+  "projects": [
+    "project-926d7d5e-b754-4b9f-b77",
+    "project-2d3a260e-688b-45af-b95",
+    "project-3fe4b845-123c-426a-aa2",
+    "project-2fe92524-b20b-4186-bef"
+  ],
+  "schema_version": 1
+}
