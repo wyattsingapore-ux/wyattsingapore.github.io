@@ -31,7 +31,7 @@ jobs:
           data=json.loads(Path('.mbff-bootstrap/request.json').read_text())
           assert data.get('schema_version') == 1
           action=data.get('action')
-          allowed={'probe','repo_access_probe','drive_access_probe','setup_worker'}
+          allowed={'probe','repo_access_probe','drive_access_probe','setup_worker','runtime_probe'}
           assert action in allowed
           if action == 'setup_worker':
               assert data.get('mutating') is True
@@ -132,19 +132,44 @@ jobs:
           from datetime import datetime, timezone
           from pathlib import Path
           root=Path(os.environ['ROOT'])
-          payload={
-            'schema_version':1,
-            'action':'setup_worker',
-            'completed':True,
-            'mutating':True,
-            'worker_root':str(root),
-            'version':os.environ['VERSION'],
-            'auth_file_present':(root/'auth/storage_state.json').is_file(),
-            'venv_present':(root/'.venv/bin/python').is_file(),
-            'wrapper_present':(root/'bin/notebooklm').is_file(),
-            'checked_at':datetime.now(timezone.utc).isoformat(),
-          }
+          payload={'schema_version':1,'action':'setup_worker','completed':True,'mutating':True,'worker_root':str(root),'version':os.environ['VERSION'],'auth_file_present':(root/'auth/storage_state.json').is_file(),'venv_present':(root/'.venv/bin/python').is_file(),'wrapper_present':(root/'bin/notebooklm').is_file(),'checked_at':datetime.now(timezone.utc).isoformat()}
           Path('.mbff-bootstrap/results/setup-worker.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Probe NotebookLM runtime syntax and existing MBFF notebooks
+        if: steps.request.outputs.action == 'runtime_probe'
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/mbff-notebooklm-worker"
+          CLI="$ROOT/bin/notebooklm"
+          mkdir -p .mbff-bootstrap/results
+          "$CLI" artifact poll --help > /tmp/mbff-poll-help.txt 2>&1 || true
+          "$CLI" artifact wait --help > /tmp/mbff-wait-help.txt 2>&1 || true
+          "$CLI" source wait --help > /tmp/mbff-source-wait-help.txt 2>&1 || true
+          "$CLI" list --json > /tmp/mbff-notebooks.json 2>/tmp/mbff-notebooks.err || true
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          def lines(path):
+              return Path(path).read_text(errors='replace').splitlines()[:160]
+          raw=Path('/tmp/mbff-notebooks.json').read_text(errors='replace').strip()
+          data=None
+          try: data=json.loads(raw) if raw else None
+          except Exception: pass
+          items=[]
+          if isinstance(data,list): items=data
+          elif isinstance(data,dict):
+              for key in ('notebooks','items','data'):
+                  if isinstance(data.get(key),list): items=data[key]; break
+          matches=[]
+          for item in items:
+              if not isinstance(item,dict): continue
+              title=str(item.get('title') or item.get('name') or '')
+              if title.lower().startswith('mbff'):
+                  matches.append({'id':item.get('id') or item.get('notebook_id') or item.get('notebookId'),'title':title})
+          payload={'schema_version':1,'action':'runtime_probe','completed':True,'mutating':False,'auth_file_present':Path('/home/ubuntu/mbff-notebooklm-worker/auth/storage_state.json').is_file(),'poll_help':lines('/tmp/mbff-poll-help.txt'),'wait_help':lines('/tmp/mbff-wait-help.txt'),'source_wait_help':lines('/tmp/mbff-source-wait-help.txt'),'notebook_list_parseable':data is not None,'mbff_notebooks':matches,'checked_at':datetime.now(timezone.utc).isoformat()}
+          Path('.mbff-bootstrap/results/runtime-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
           PY
 
       - name: Commit sanitized result
