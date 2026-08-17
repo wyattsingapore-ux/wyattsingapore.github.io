@@ -1,0 +1,18 @@
+{
+  "action": "drive_access_probe",
+  "any_mbff_folder_access": false,
+  "checked_at": "2026-08-17T18:42:12.252742+00:00",
+  "completed": true,
+  "mutating": false,
+  "remotes": [
+    {
+      "mbff_folder_access": false,
+      "remote": "gdruve:"
+    },
+    {
+      "mbff_folder_access": false,
+      "remote": "gdrive:"
+    }
+  ],
+  "schema_version": 1
+}
