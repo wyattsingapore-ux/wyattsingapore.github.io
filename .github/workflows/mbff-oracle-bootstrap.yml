@@ -1,0 +1,66 @@
+name: mbff-oracle-bootstrap
+
+on:
+  push:
+    paths:
+      - ".mbff-bootstrap/request.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mbff-oracle-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact Oracle host
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data=json.loads(Path('.mbff-bootstrap/request.json').read_text())
+          assert data.get('schema_version') == 1
+          assert data.get('mutating') is False
+          assert data.get('action') == 'probe'
+          PY
+
+      - name: Write sanitized bootstrap proof
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-bootstrap/results
+          python3 - <<'PY'
+          import json, os, platform
+          from datetime import datetime, timezone
+          from pathlib import Path
+          payload={
+            'schema_version':1,
+            'action':'probe',
+            'completed':True,
+            'mutating':False,
+            'hostname':platform.node(),
+            'user':os.environ.get('USER',''),
+            'machine':platform.machine(),
+            'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-bootstrap/results/probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Commit proof
+        run: |
+          set -euo pipefail
+          git config user.name "mbff-oracle-bootstrap"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-bootstrap/results/probe.json
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "Record MBFF Oracle bootstrap probe"
+          git pull --rebase origin main
+          git push origin HEAD:main
