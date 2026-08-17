@@ -1,0 +1,9 @@
+{
+  "action": "repo_access_probe",
+  "checked_at": "2026-08-17T18:41:10.419893+00:00",
+  "completed": true,
+  "https_private_repo_access": false,
+  "mutating": false,
+  "schema_version": 1,
+  "ssh_private_repo_access": false
+}
