@@ -29,7 +29,10 @@ jobs:
           import json
           from pathlib import Path
           d=json.loads(Path('.mbff-control/recover-time-dilation.json').read_text())
-          assert d == {"schema_version":1,"action":"recover_existing_time_dilation","mutating":True,"nonce":1}
+          assert d.get('schema_version') == 1
+          assert d.get('action') == 'recover_existing_time_dilation'
+          assert d.get('mutating') is True
+          assert isinstance(d.get('nonce'), int) and d['nonce'] >= 1
           PY
 
       - name: Authenticate keylessly to MBFF Google project
@@ -64,8 +67,6 @@ jobs:
             exit 0
           fi
 
-          # Use a clean current CLI for this recovery so old worker CLI behavior
-          # cannot mask the result. The production worker remains separate.
           if [ ! -x "$TMPV/bin/notebooklm" ]; then
             python3 -m venv "$TMPV" >/tmp/mbff-recover-venv.out 2>/tmp/mbff-recover-venv.err || {
               printf '%s\n' '{"ok":false,"status":"RECOVERY_VENV_FAILED"}' > "$result"; exit 0; }
@@ -73,7 +74,6 @@ jobs:
               printf '%s\n' '{"ok":false,"status":"RECOVERY_CLI_INSTALL_FAILED"}' > "$result"; exit 0; }
           fi
 
-          # Real authenticated notebook read. Never echo notebook list to logs.
           "$TMPV/bin/notebooklm" --storage "$AUTH" list --json >/tmp/mbff-recover-list.json 2>/tmp/mbff-recover-list.err
           if [ $? -ne 0 ]; then
             printf '%s\n' '{"ok":false,"status":"ORACLE_NOTEBOOKLM_AUTH_FAILED"}' > "$result"
@@ -82,8 +82,7 @@ jobs:
 
           python3 - <<'PY'
           import json, os, sys
-          p='/tmp/mbff-recover-list.json'
-          try: d=json.load(open(p))
+          try: d=json.load(open('/tmp/mbff-recover-list.json'))
           except Exception: sys.exit(2)
           rows=d.get('notebooks',[]) if isinstance(d,dict) else []
           target=os.environ['NB_ID']
@@ -95,24 +94,41 @@ jobs:
             *) printf '%s\n' '{"ok":false,"status":"NOTEBOOK_LIST_PARSE_FAILED"}' > "$result"; exit 0 ;;
           esac
 
-          # Artifact list is diagnostic only. Direct download is the readiness test.
           "$TMPV/bin/notebooklm" --storage "$AUTH" artifact list -n "$NB_ID" --type video --json >/tmp/mbff-recover-artifacts.json 2>/tmp/mbff-recover-artifacts.err
 
           "$TMPV/bin/notebooklm" --storage "$AUTH" download cinematic-video "$OUT" -n "$NB_ID" -a "$ART_ID" --force --json >/tmp/mbff-recover-download.json 2>/tmp/mbff-recover-download.err
           dlrc=$?
           if [ "$dlrc" -ne 0 ]; then
-            if grep -Eqi '401|Authentication required' /tmp/mbff-recover-download.err /tmp/mbff-recover-download.json 2>/dev/null; then
-              printf '%s\n' '{"ok":false,"status":"MEDIA_CDN_AUTH_401"}' > "$result"
-            elif grep -Eqi '403' /tmp/mbff-recover-download.err /tmp/mbff-recover-download.json 2>/dev/null; then
-              printf '%s\n' '{"ok":false,"status":"MEDIA_CDN_AUTH_403"}' > "$result"
-            else
-              printf '%s\n' '{"ok":false,"status":"DIRECT_DOWNLOAD_FAILED"}' > "$result"
-            fi
+            python3 - <<'PY'
+          import json, re
+          from pathlib import Path
+          raw=''
+          for p in ('/tmp/mbff-recover-download.err','/tmp/mbff-recover-download.json'):
+              try: raw += '\n' + Path(p).read_text(errors='replace')
+              except Exception: pass
+          low=raw.lower()
+          if '401' in low or 'authentication required' in low:
+              status='MEDIA_CDN_AUTH_401'
+          elif '403' in low:
+              status='MEDIA_CDN_AUTH_403'
+          elif 'no completed' in low or 'not ready' in low:
+              status='ARTIFACT_REPORTED_NOT_READY'
+          elif 'no such option' in low or 'usage:' in low:
+              status='CLI_ARGUMENT_MISMATCH'
+          elif 'not found' in low:
+              status='ARTIFACT_NOT_FOUND'
+          else:
+              status='DIRECT_DOWNLOAD_FAILED'
+          safe=re.sub(r'https?://\S+','<redacted-url>',raw)
+          safe=re.sub(r'(?i)(cookie|authorization|token)(\s*[:=]\s*)\S+',r'\1\2<redacted>',safe)
+          safe=re.sub(r'[A-Za-z0-9_\-]{80,}','<redacted-long-value>',safe)
+          safe=' '.join(safe.split())[:500]
+          json.dump({'ok':False,'status':status,'detail':safe},open('/tmp/mbff-recover-result.json','w'),indent=2,sort_keys=True)
+          PY
             rm -f "$OUT"
             exit 0
           fi
 
-          # Strong media QC.
           ffprobe -v error -show_streams -show_format -of json "$OUT" >/tmp/mbff-recover-ffprobe.json 2>/tmp/mbff-recover-ffprobe.err
           if [ $? -ne 0 ]; then
             printf '%s\n' '{"ok":false,"status":"FFPROBE_FAILED"}' > "$result"; rm -f "$OUT"; exit 0
@@ -135,9 +151,8 @@ jobs:
             printf '%s\n' '{"ok":false,"status":"MEDIA_QC_FAILED"}' > "$result"; rm -f "$OUT"; exit 0
           fi
 
-          # Replace bytes in the pre-created user-owned Drive placeholder.
           OUT="$OUT" "$ROOT/.venv/bin/python" - <<'PY' >/tmp/mbff-recover-drive.out 2>/tmp/mbff-recover-drive.err
-          import os, google.auth, requests
+          import os, google.auth
           from google.auth.transport.requests import AuthorizedSession
           creds,_=google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
           s=AuthorizedSession(creds)
@@ -170,9 +185,10 @@ jobs:
           from pathlib import Path
           try: d=json.loads(Path('/tmp/mbff-recover-result.json').read_text())
           except Exception: d={'ok':False,'status':'RECOVERY_RESULT_MISSING'}
-          safe={k:d.get(k) for k in ('ok','status','notebook_id','artifact_id','drive_file_id','qc') if k in d}
+          safe={k:d.get(k) for k in ('ok','status','detail','notebook_id','artifact_id','drive_file_id','qc') if k in d}
           safe['schema_version']=1
           safe['checked_at']=datetime.now(timezone.utc).isoformat()
+          safe['run_id']='${{ github.run_id }}'
           Path('.mbff-control/results/recover-time-dilation.json').write_text(json.dumps(safe,indent=2,sort_keys=True)+'\n')
           PY
           git config user.name "mbff-oracle-worker"
