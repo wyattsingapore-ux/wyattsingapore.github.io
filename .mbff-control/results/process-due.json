@@ -1,6 +1,17 @@
 {
-  "checked_at": "2026-08-18T04:57:02.367374+00:00",
-  "completed": false,
+  "checked_at": "2026-08-18T04:58:58.829725+00:00",
+  "completed": true,
+  "failure_class": "none",
+  "runtime": {
+    "adc_env_present": true,
+    "drive_runner_executable": true,
+    "drive_runner_exists": true,
+    "google_auth_import": true,
+    "requests_import": true,
+    "worker_executable": true,
+    "worker_exists": true
+  },
   "schema_version": 1,
-  "status": "WORKER_FAILED"
+  "status": "NO_PENDING_JOB",
+  "worker_exit_code": 0
 }
