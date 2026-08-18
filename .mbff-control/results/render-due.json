@@ -1,0 +1,11 @@
+{
+  "checked_at": "2026-08-18T08:34:20.175648+00:00",
+  "completed": true,
+  "schema_version": 1,
+  "stages": {
+    "render": "success",
+    "select": "success",
+    "upload": "success"
+  },
+  "status": "NO_RENDER_DUE"
+}
