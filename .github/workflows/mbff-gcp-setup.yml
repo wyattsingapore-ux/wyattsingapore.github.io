@@ -15,7 +15,7 @@ concurrency:
 jobs:
   setup:
     runs-on: self-hosted
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Verify exact Oracle host and approved request
@@ -33,7 +33,7 @@ jobs:
           PY
       - name: Create isolated keyless MBFF identity infrastructure
         env:
-          PROJECT_ID: project-2fe92524-b20b-4186-bef
+          PROJECT_ID: mbff-cloud-publisher-wt26
           SA_NAME: mbff-oracle-drive
           POOL_ID: github-mbff
           PROVIDER_ID: github
@@ -42,7 +42,13 @@ jobs:
           PRIVATE_REPO_ID: "1312612135"
         run: |
           set -euo pipefail
-          gcloud projects describe "$PROJECT_ID" >/dev/null
+          ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n1)"
+          test "$ACTIVE_ACCOUNT" = "wyattsingapore@gmail.com"
+
+          if ! gcloud projects describe "$PROJECT_ID" >/dev/null 2>&1; then
+            gcloud projects create "$PROJECT_ID" --name="MBFF Cloud Publisher" --quiet
+          fi
+
           gcloud services enable \
             iam.googleapis.com \
             iamcredentials.googleapis.com \
@@ -102,7 +108,7 @@ jobs:
             'completed':True,
             'mutating':True,
             'keyless':True,
-            'shared_project_container':True,
+            'dedicated_project':True,
             'project_id':os.environ['PROJECT_ID'],
             'project_number':os.environ['PROJECT_NUMBER'],
             'service_account':os.environ['SA_EMAIL'],
