@@ -1,0 +1,227 @@
+name: mbff-oracle-render-due
+
+on:
+  push:
+    paths:
+      - ".mbff-control/render-due.json"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-oracle-render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Oracle host and generic request
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('.mbff-control/render-due.json').read_text())
+          assert d.get('schema_version') == 1
+          assert d.get('action') == 'render_due_mbff'
+          assert d.get('mutating') is True
+          assert not any(k in d for k in ('episode_id','title','episode_folder_id','raw_file_id'))
+          PY
+
+      - name: Authenticate keylessly to MBFF Google project
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Prepare isolated Drive client
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/mbff-render-venv
+          python3 -m venv /tmp/mbff-render-venv
+          /tmp/mbff-render-venv/bin/python -m pip install -q google-auth requests
+          command -v ffmpeg
+          command -v ffprobe
+
+      - name: Select due render and download inputs
+        id: select
+        continue-on-error: true
+        env:
+          JOBS_FOLDER_ID: "19lQQJpzToSIamqR2h16KaXSM8afwxZfX"
+          OUTRO_FILE_ID: "1l09ZUavw7DqjNCyu2GzsQiNv8G0PwxGL"
+        run: |
+          set +e
+          /tmp/mbff-render-venv/bin/python - <<'PY' > /tmp/mbff-render-select.json 2>/tmp/mbff-render-select.err
+          import json, os, pathlib
+          import google.auth
+          from google.auth.transport.requests import AuthorizedSession
+
+          DRIVE_SCOPE='https://www.googleapis.com/auth/drive'
+          FILES='https://www.googleapis.com/drive/v3/files'
+          creds,_=google.auth.default(scopes=[DRIVE_SCOPE])
+          s=AuthorizedSession(creds)
+
+          def get_json_file(fid):
+              r=s.get(f'{FILES}/{fid}',params={'alt':'media','supportsAllDrives':'true'},timeout=60)
+              if not r.ok: raise RuntimeError(f'json HTTP {r.status_code}')
+              return r.json()
+
+          def list_children(parent):
+              q=f"'{parent}' in parents and trashed=false"
+              r=s.get(FILES,params={'q':q,'fields':'files(id,name,mimeType,size,modifiedTime)','pageSize':1000,'supportsAllDrives':'true'},timeout=60)
+              if not r.ok: raise RuntimeError(f'list HTTP {r.status_code}')
+              return r.json().get('files',[])
+
+          candidate=None
+          for jf in list_children(os.environ['JOBS_FOLDER_ID']):
+              if not jf.get('name','').endswith('.json'):
+                  continue
+              try:
+                  job=get_json_file(jf['id'])
+              except Exception:
+                  continue
+              episode_id=str(job.get('episode_id') or '')
+              folder=str(job.get('episode_folder_id') or '')
+              raw_name=str(job.get('output_name') or '')
+              if not episode_id or not folder or not raw_name:
+                  continue
+              children=list_children(folder)
+              by_name={x.get('name'):x for x in children}
+              raw=by_name.get(raw_name)
+              target=by_name.get(f'{episode_id}_master_with_outro.mp4')
+              if not raw or not target:
+                  continue
+              # User-owned target placeholder is created as a copy of raw.
+              # Equal byte size means it has not yet been replaced by rendered output.
+              if str(raw.get('size','')) != str(target.get('size','')):
+                  continue
+              candidate={'episode_id':episode_id,'folder_id':folder,'raw':raw,'target':target}
+              break
+
+          if not candidate:
+              print(json.dumps({'ok':True,'status':'NO_RENDER_DUE'}))
+              raise SystemExit(0)
+
+          def download(fid,path):
+              with s.get(f'{FILES}/{fid}',params={'alt':'media','supportsAllDrives':'true'},stream=True,timeout=300) as r:
+                  if not r.ok: raise RuntimeError(f'download HTTP {r.status_code}')
+                  with open(path,'wb') as f:
+                      for chunk in r.iter_content(chunk_size=1024*1024):
+                          if chunk: f.write(chunk)
+
+          download(candidate['raw']['id'],'/tmp/mbff-main.mp4')
+          download(os.environ['OUTRO_FILE_ID'],'/tmp/mbff-outro-landscape.mp4')
+          pathlib.Path('/tmp/mbff-render-meta.json').write_text(json.dumps(candidate))
+          print(json.dumps({'ok':True,'status':'INPUTS_READY','episode_id':candidate['episode_id'],'target_file_id':candidate['target']['id']}))
+          PY
+          rc=$?
+          echo "$rc" > /tmp/mbff-render-select.code
+          exit "$rc"
+
+      - name: Render landscape master on Oracle
+        id: render
+        if: steps.select.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          if [ ! -s /tmp/mbff-render-meta.json ]; then
+            echo 0 > /tmp/mbff-render.code
+            exit 0
+          fi
+          ffmpeg -y \
+            -i /tmp/mbff-main.mp4 -i /tmp/mbff-outro-landscape.mp4 \
+            -filter_complex "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0];[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1];[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a0];[1:a]aformat=sample_rates=48000:channel_layouts=stereo[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]" \
+            -map "[v]" -map "[a]" \
+            -c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p \
+            -c:a aac -b:a 192k \
+            /tmp/mbff-master-with-outro.mp4 \
+            > /tmp/mbff-render-ffmpeg.log 2>&1
+          rc=$?
+          echo "$rc" > /tmp/mbff-render.code
+          exit "$rc"
+
+      - name: Validate and replace Drive output placeholder
+        id: upload
+        if: steps.render.outcome == 'success'
+        continue-on-error: true
+        run: |
+          set +e
+          if [ ! -s /tmp/mbff-render-meta.json ]; then
+            printf '%s\n' '{"ok":true,"status":"NO_RENDER_DUE"}' > /tmp/mbff-render-result.json
+            exit 0
+          fi
+          ffprobe -v error -print_format json -show_format -show_streams /tmp/mbff-main.mp4 > /tmp/mbff-main.ffprobe.json
+          ffprobe -v error -print_format json -show_format -show_streams /tmp/mbff-master-with-outro.mp4 > /tmp/mbff-master.ffprobe.json
+          /tmp/mbff-render-venv/bin/python - <<'PY' > /tmp/mbff-render-result.json 2>/tmp/mbff-render-upload.err
+          import json, os
+          from pathlib import Path
+          import google.auth
+          from google.auth.transport.requests import AuthorizedSession
+
+          main=json.loads(Path('/tmp/mbff-main.ffprobe.json').read_text())
+          out=json.loads(Path('/tmp/mbff-master.ffprobe.json').read_text())
+          meta=json.loads(Path('/tmp/mbff-render-meta.json').read_text())
+
+          def duration(d): return float(d.get('format',{}).get('duration',0.0))
+          streams=out.get('streams',[])
+          vids=[s for s in streams if s.get('codec_type')=='video']
+          auds=[s for s in streams if s.get('codec_type')=='audio']
+          if not vids or not auds: raise RuntimeError('missing audio/video stream')
+          v=vids[0]
+          if int(v.get('width',0)) != 1920 or int(v.get('height',0)) != 1080:
+              raise RuntimeError('wrong output dimensions')
+          if duration(out) <= duration(main)+1.0:
+              raise RuntimeError('outro duration not appended')
+          p=Path('/tmp/mbff-master-with-outro.mp4')
+          if p.stat().st_size < 1_000_000:
+              raise RuntimeError('render output too small')
+
+          DRIVE_SCOPE='https://www.googleapis.com/auth/drive'
+          UPLOAD='https://www.googleapis.com/upload/drive/v3/files'
+          creds,_=google.auth.default(scopes=[DRIVE_SCOPE])
+          s=AuthorizedSession(creds)
+          target=meta['target']['id']
+          with p.open('rb') as f:
+              r=s.patch(f'{UPLOAD}/{target}',params={'uploadType':'media','supportsAllDrives':'true'},headers={'Content-Type':'video/mp4'},data=f,timeout=600)
+          if not r.ok: raise RuntimeError(f'upload HTTP {r.status_code}')
+          print(json.dumps({'ok':True,'status':'RENDER_COMPLETE','episode_id':meta['episode_id'],'target_file_id':target,'duration_seconds':round(duration(out),3),'width':1920,'height':1080,'has_audio':True,'has_video':True,'size_bytes':p.stat().st_size},sort_keys=True))
+          PY
+
+      - name: Commit sanitized render evidence
+        if: always()
+        env:
+          SELECT_OUTCOME: ${{ steps.select.outcome }}
+          RENDER_OUTCOME: ${{ steps.render.outcome }}
+          UPLOAD_OUTCOME: ${{ steps.upload.outcome }}
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-control/results
+          python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          try: d=json.loads(Path('/tmp/mbff-render-result.json').read_text())
+          except Exception: d={}
+          stages={'select':os.environ.get('SELECT_OUTCOME','skipped'),'render':os.environ.get('RENDER_OUTCOME','skipped'),'upload':os.environ.get('UPLOAD_OUTCOME','skipped')}
+          status=str(d.get('status') or 'RENDER_FAILED')[:80]
+          completed=bool(d.get('ok')) and status in ('RENDER_COMPLETE','NO_RENDER_DUE')
+          out={'schema_version':1,'completed':completed,'status':status,'checked_at':datetime.now(timezone.utc).isoformat(),'stages':stages}
+          for k in ('episode_id','duration_seconds','width','height','has_audio','has_video','size_bytes'):
+              if k in d: out[k]=d[k]
+          Path('.mbff-control/results/render-due.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name "mbff-oracle-renderer"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-control/results/render-due.json
+          git commit -m "Record sanitized MBFF Oracle render" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
