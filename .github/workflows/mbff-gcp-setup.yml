@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+
       - name: Verify exact Oracle host and approved request
         run: |
           set -euo pipefail
@@ -31,7 +32,10 @@ jobs:
           assert d.get('action') == 'setup_mbff_gcp'
           assert d.get('mutating') is True
           PY
-      - name: Create isolated keyless MBFF identity infrastructure
+
+      - name: Provision MBFF keyless identity
+        id: provision
+        continue-on-error: true
         env:
           PROJECT_ID: mbff-cloud-publisher-wt26
           SA_NAME: mbff-oracle-drive
@@ -41,88 +45,90 @@ jobs:
           PUBLIC_REPO_ID: "1179747154"
           PRIVATE_REPO_ID: "1312612135"
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          mkdir -p .mbff-bootstrap/results
+
+          write_result() {
+            STATUS="$1" STAGE="$2" PROJECT_ID="$PROJECT_ID" SA_NAME="$SA_NAME" POOL_ID="$POOL_ID" PROVIDER_ID="$PROVIDER_ID" python3 - <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          p={
+            'schema_version':1,
+            'action':'setup_mbff_gcp',
+            'completed':os.environ['STATUS']=='success',
+            'status':os.environ['STATUS'],
+            'stage':os.environ['STAGE'],
+            'keyless':True,
+            'dedicated_project':True,
+            'project_id':os.environ['PROJECT_ID'],
+            'service_account':f"{os.environ['SA_NAME']}@{os.environ['PROJECT_ID']}.iam.gserviceaccount.com",
+            'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-bootstrap/results/gcp-setup.json').write_text(json.dumps(p,indent=2,sort_keys=True)+'\n')
+          PY
+          }
+
+          fail() { write_result failed "$1"; exit 1; }
+
           ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' | head -n1)"
-          test "$ACTIVE_ACCOUNT" = "wyattsingapore@gmail.com"
+          [ "$ACTIVE_ACCOUNT" = "wyattsingapore@gmail.com" ] || fail active_account
 
           if ! gcloud projects describe "$PROJECT_ID" >/dev/null 2>&1; then
-            gcloud projects create "$PROJECT_ID" --name="MBFF Cloud Publisher" --quiet
+            gcloud projects create "$PROJECT_ID" --name="MBFF Cloud Publisher" --quiet >/dev/null 2>&1 || fail project_create
           fi
 
-          gcloud services enable \
-            iam.googleapis.com \
-            iamcredentials.googleapis.com \
-            sts.googleapis.com \
-            drive.googleapis.com \
-            --project="$PROJECT_ID" --quiet
+          gcloud services enable iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com drive.googleapis.com --project="$PROJECT_ID" --quiet >/dev/null 2>&1 || fail api_enable
 
           SA_EMAIL="${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com"
           if ! gcloud iam service-accounts describe "$SA_EMAIL" --project="$PROJECT_ID" >/dev/null 2>&1; then
-            gcloud iam service-accounts create "$SA_NAME" \
-              --project="$PROJECT_ID" \
-              --display-name="MBFF Oracle Drive Worker" \
-              --description="Keyless Drive identity for MBFF Oracle NotebookLM worker" \
-              --quiet
+            gcloud iam service-accounts create "$SA_NAME" --project="$PROJECT_ID" --display-name="MBFF Oracle Drive Worker" --description="Keyless Drive identity for MBFF Oracle NotebookLM worker" --quiet >/dev/null 2>&1 || fail service_account_create
           fi
 
           if ! gcloud iam workload-identity-pools describe "$POOL_ID" --project="$PROJECT_ID" --location=global >/dev/null 2>&1; then
-            gcloud iam workload-identity-pools create "$POOL_ID" \
-              --project="$PROJECT_ID" --location=global \
-              --display-name="MBFF GitHub" \
-              --description="GitHub OIDC identities permitted to control MBFF Oracle worker" \
-              --quiet
+            gcloud iam workload-identity-pools create "$POOL_ID" --project="$PROJECT_ID" --location=global --display-name="MBFF GitHub" --description="GitHub OIDC identities permitted to control MBFF Oracle worker" --quiet >/dev/null 2>&1 || fail pool_create
           fi
 
           CONDITION="assertion.repository_owner_id=='${OWNER_ID}' && (assertion.repository_id=='${PUBLIC_REPO_ID}' || assertion.repository_id=='${PRIVATE_REPO_ID}') && assertion.ref=='refs/heads/main'"
           MAPPING="google.subject=assertion.sub,attribute.repository_id=assertion.repository_id,attribute.repository_owner_id=assertion.repository_owner_id,attribute.ref=assertion.ref"
           if ! gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" --project="$PROJECT_ID" --location=global --workload-identity-pool="$POOL_ID" >/dev/null 2>&1; then
-            gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" \
-              --project="$PROJECT_ID" --location=global \
-              --workload-identity-pool="$POOL_ID" \
-              --issuer-uri="https://token.actions.githubusercontent.com" \
-              --attribute-mapping="$MAPPING" \
-              --attribute-condition="$CONDITION" \
-              --display-name="GitHub Actions" \
-              --quiet
+            gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" --project="$PROJECT_ID" --location=global --workload-identity-pool="$POOL_ID" --issuer-uri="https://token.actions.githubusercontent.com" --attribute-mapping="$MAPPING" --attribute-condition="$CONDITION" --display-name="GitHub Actions" --quiet >/dev/null 2>&1 || fail provider_create
           fi
 
-          PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
+          PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null)"
+          [ -n "$PROJECT_NUMBER" ] || fail project_number
+
           for REPO_ID in "$PUBLIC_REPO_ID" "$PRIVATE_REPO_ID"; do
             MEMBER="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}/attribute.repository_id/${REPO_ID}"
-            gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
-              --project="$PROJECT_ID" \
-              --role="roles/iam.workloadIdentityUser" \
-              --member="$MEMBER" \
-              --quiet >/dev/null
+            gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" --project="$PROJECT_ID" --role="roles/iam.workloadIdentityUser" --member="$MEMBER" --quiet >/dev/null 2>&1 || fail wif_binding
           done
 
-          mkdir -p .mbff-bootstrap/results
-          PROJECT_ID="$PROJECT_ID" PROJECT_NUMBER="$PROJECT_NUMBER" SA_EMAIL="$SA_EMAIL" POOL_ID="$POOL_ID" PROVIDER_ID="$PROVIDER_ID" python3 - <<'PY'
+          STATUS=success STAGE=complete PROJECT_ID="$PROJECT_ID" PROJECT_NUMBER="$PROJECT_NUMBER" SA_EMAIL="$SA_EMAIL" POOL_ID="$POOL_ID" PROVIDER_ID="$PROVIDER_ID" python3 - <<'PY'
           import json, os
           from datetime import datetime, timezone
           from pathlib import Path
           provider=f"projects/{os.environ['PROJECT_NUMBER']}/locations/global/workloadIdentityPools/{os.environ['POOL_ID']}/providers/{os.environ['PROVIDER_ID']}"
-          payload={
-            'schema_version':1,
-            'action':'setup_mbff_gcp',
-            'completed':True,
-            'mutating':True,
-            'keyless':True,
-            'dedicated_project':True,
-            'project_id':os.environ['PROJECT_ID'],
-            'project_number':os.environ['PROJECT_NUMBER'],
-            'service_account':os.environ['SA_EMAIL'],
-            'workload_identity_provider':provider,
-            'checked_at':datetime.now(timezone.utc).isoformat(),
+          p={
+            'schema_version':1,'action':'setup_mbff_gcp','completed':True,'status':'success','stage':'complete',
+            'keyless':True,'dedicated_project':True,'project_id':os.environ['PROJECT_ID'],
+            'project_number':os.environ['PROJECT_NUMBER'],'service_account':os.environ['SA_EMAIL'],
+            'workload_identity_provider':provider,'checked_at':datetime.now(timezone.utc).isoformat(),
           }
-          Path('.mbff-bootstrap/results/gcp-setup.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          Path('.mbff-bootstrap/results/gcp-setup.json').write_text(json.dumps(p,indent=2,sort_keys=True)+'\n')
           PY
-      - name: Commit non-secret setup result
+
+      - name: Commit sanitized setup result
+        if: always()
         run: |
           set -euo pipefail
+          test -f .mbff-bootstrap/results/gcp-setup.json || exit 0
           git config user.name "mbff-oracle-bootstrap"
           git config user.email "actions@users.noreply.github.com"
           git add .mbff-bootstrap/results/gcp-setup.json
-          git commit -m "Record MBFF keyless GCP identity setup" || exit 0
+          git commit -m "Record MBFF GCP bootstrap result" || exit 0
           git pull --rebase origin main
           git push origin HEAD:main
+
+      - name: Fail workflow when provisioning failed
+        if: steps.provision.outcome == 'failure'
+        run: exit 1
