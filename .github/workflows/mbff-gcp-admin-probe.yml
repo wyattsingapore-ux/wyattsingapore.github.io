@@ -1,0 +1,58 @@
+name: mbff-gcp-admin-probe
+
+on:
+  push:
+    paths:
+      - ".mbff-bootstrap/gcp-admin-probe.json"
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify Oracle host
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+      - name: Read project IAM administrators
+        env:
+          PROJECT_ID: project-2fe92524-b20b-4186-bef
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-bootstrap/results
+          python3 - <<'PY'
+          import json, subprocess, os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          project=os.environ['PROJECT_ID']
+          p=subprocess.run(['gcloud','projects','get-iam-policy',project,'--format=json'],text=True,capture_output=True,timeout=60)
+          payload={'schema_version':1,'completed':p.returncode==0,'project_id':project,'admin_users':[],'checked_at':datetime.now(timezone.utc).isoformat()}
+          if p.returncode==0:
+              data=json.loads(p.stdout or '{}')
+              interesting={'roles/owner','roles/editor','roles/serviceusage.serviceUsageAdmin','roles/iam.serviceAccountAdmin','roles/iam.workloadIdentityPoolAdmin'}
+              seen=set()
+              for b in data.get('bindings',[]):
+                  if b.get('role') not in interesting: continue
+                  for m in b.get('members',[]):
+                      if m.startswith('user:'):
+                          email=m.split(':',1)[1]
+                          if email not in seen:
+                              seen.add(email); payload['admin_users'].append(email)
+          else:
+              payload['error']='iam_policy_read_denied'
+          Path('.mbff-bootstrap/results/gcp-admin-probe.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+      - name: Commit sanitized result
+        run: |
+          set -euo pipefail
+          git config user.name "mbff-oracle-bootstrap"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-bootstrap/results/gcp-admin-probe.json
+          git commit -m "Record MBFF GCP admin probe" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
