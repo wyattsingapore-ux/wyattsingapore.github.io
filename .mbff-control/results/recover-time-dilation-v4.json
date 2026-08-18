@@ -1,0 +1,18 @@
+{
+  "artifact_id": "06a89b8e-23d8-4d5c-978e-106da6afb177",
+  "checked_at": "2026-08-18T07:17:23.924099+00:00",
+  "default_profile_shim": true,
+  "drive_file_id": "1-U3nR3B_ITxy_Npz1ngDZcXDKSZKOHfg",
+  "notebook_id": "ef32ab87-5716-4125-acfd-28234d5f9b5d",
+  "ok": true,
+  "qc": {
+    "bytes": 57681769,
+    "duration_seconds": 340.752834,
+    "ffprobe_installed_now": true,
+    "height": 720,
+    "width": 1280
+  },
+  "run_id": "32110647255",
+  "schema_version": 1,
+  "status": "RECOVERED_TO_DRIVE"
+}
