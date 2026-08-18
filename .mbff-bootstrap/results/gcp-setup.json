@@ -1,0 +1,14 @@
+{
+  "action": "setup_mbff_gcp",
+  "checked_at": "2026-08-18T04:42:30.036786+00:00",
+  "completed": true,
+  "dedicated_project": true,
+  "keyless": true,
+  "project_id": "mbff-cloud-publisher-wt26",
+  "project_number": "209601201824",
+  "schema_version": 1,
+  "service_account": "mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com",
+  "stage": "complete",
+  "status": "success",
+  "workload_identity_provider": "projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github"
+}
