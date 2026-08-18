@@ -1,18 +1,18 @@
 {
-  "all_folders_accessible": false,
-  "checked_at": "2026-08-18T04:45:23.619939+00:00",
+  "all_folders_accessible": true,
+  "checked_at": "2026-08-18T04:56:11.891475+00:00",
   "completed": true,
   "keyless_auth_succeeded": true,
   "probes": {
     "cloud_control": {
-      "accessible": false,
-      "http_status": 404,
-      "name_match": false
+      "accessible": true,
+      "http_status": 200,
+      "name_match": true
     },
     "jobs": {
-      "accessible": false,
-      "http_status": 404,
-      "name_match": false
+      "accessible": true,
+      "http_status": 200,
+      "name_match": true
     },
     "jobs_list": {
       "accessible": true,
@@ -20,19 +20,19 @@
       "http_status": 200
     },
     "logs": {
-      "accessible": false,
-      "http_status": 404,
-      "name_match": false
+      "accessible": true,
+      "http_status": 200,
+      "name_match": true
     },
     "mbff_root": {
-      "accessible": false,
-      "http_status": 404,
-      "name_match": false
+      "accessible": true,
+      "http_status": 200,
+      "name_match": true
     },
     "state": {
-      "accessible": false,
-      "http_status": 404,
-      "name_match": false
+      "accessible": true,
+      "http_status": 200,
+      "name_match": true
     }
   },
   "schema_version": 1
