@@ -1,7 +1,7 @@
 {
-  "checked_at": "2026-08-18T04:58:58.829725+00:00",
-  "completed": true,
-  "failure_class": "none",
+  "checked_at": "2026-08-18T05:08:50.785812+00:00",
+  "completed": false,
+  "failure_class": "python_traceback",
   "runtime": {
     "adc_env_present": true,
     "drive_runner_executable": true,
@@ -12,6 +12,6 @@
     "worker_exists": true
   },
   "schema_version": 1,
-  "status": "NO_PENDING_JOB",
-  "worker_exit_code": 0
+  "status": "WORKER_FAILED",
+  "worker_exit_code": 1
 }
