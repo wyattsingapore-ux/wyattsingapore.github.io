@@ -1,6 +1,8 @@
 {
-  "checked_at": "2026-08-18T07:09:40.532580+00:00",
+  "checked_at": "2026-08-18T07:11:46.930912+00:00",
+  "detail": "{ \"error\": \"Storage file not found: /home/ubuntu/.notebooklm/profiles/default/storage_state.json\\nRun 'notebooklm login' to authenticate first.\", \"artifact\": { \"id\": \"06a89b8e-23d8-4d5c-978e-106da6afb177\", \"title\": \"The Two Ways to Bend Time\", \"created_at\": 1786993822 } }",
   "ok": false,
+  "run_id": "32110266779",
   "schema_version": 1,
-  "status": "DIRECT_DOWNLOAD_FAILED"
+  "status": "ARTIFACT_NOT_FOUND"
 }
