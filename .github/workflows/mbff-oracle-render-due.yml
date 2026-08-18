@@ -43,7 +43,7 @@ jobs:
           service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
           create_credentials_file: true
 
-      - name: Prepare isolated Drive client
+      - name: Prepare tools
         run: |
           set -euo pipefail
           rm -rf /tmp/mbff-render-venv
@@ -61,50 +61,40 @@ jobs:
         run: |
           set +e
           /tmp/mbff-render-venv/bin/python - <<'PY' > /tmp/mbff-render-select.json 2>/tmp/mbff-render-select.err
-          import json, os, pathlib
+          import json, os
+          from pathlib import Path
           import google.auth
           from google.auth.transport.requests import AuthorizedSession
 
-          DRIVE_SCOPE='https://www.googleapis.com/auth/drive'
           FILES='https://www.googleapis.com/drive/v3/files'
-          creds,_=google.auth.default(scopes=[DRIVE_SCOPE])
+          creds,_=google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
           s=AuthorizedSession(creds)
 
-          def get_json_file(fid):
+          def list_children(parent):
+              r=s.get(FILES,params={'q':f"'{parent}' in parents and trashed=false",'fields':'files(id,name,mimeType,size)','pageSize':1000,'supportsAllDrives':'true'},timeout=60)
+              if not r.ok: raise RuntimeError(f'list HTTP {r.status_code}')
+              return r.json().get('files',[])
+
+          def load_json(fid):
               r=s.get(f'{FILES}/{fid}',params={'alt':'media','supportsAllDrives':'true'},timeout=60)
               if not r.ok: raise RuntimeError(f'json HTTP {r.status_code}')
               return r.json()
 
-          def list_children(parent):
-              q=f"'{parent}' in parents and trashed=false"
-              r=s.get(FILES,params={'q':q,'fields':'files(id,name,mimeType,size,modifiedTime)','pageSize':1000,'supportsAllDrives':'true'},timeout=60)
-              if not r.ok: raise RuntimeError(f'list HTTP {r.status_code}')
-              return r.json().get('files',[])
-
           candidate=None
           for jf in list_children(os.environ['JOBS_FOLDER_ID']):
-              if not jf.get('name','').endswith('.json'):
-                  continue
-              try:
-                  job=get_json_file(jf['id'])
-              except Exception:
-                  continue
+              if not jf.get('name','').endswith('.json'): continue
+              try: job=load_json(jf['id'])
+              except Exception: continue
               episode_id=str(job.get('episode_id') or '')
               folder=str(job.get('episode_folder_id') or '')
-              raw_name=str(job.get('output_name') or '')
-              if not episode_id or not folder or not raw_name:
-                  continue
-              children=list_children(folder)
-              by_name={x.get('name'):x for x in children}
+              raw_name=str(job.get('output_filename') or job.get('output_name') or '')
+              if not episode_id or not folder or not raw_name: continue
+              by_name={x.get('name'):x for x in list_children(folder)}
               raw=by_name.get(raw_name)
               target=by_name.get(f'{episode_id}_master_with_outro.mp4')
-              if not raw or not target:
-                  continue
-              # User-owned target placeholder is created as a copy of raw.
-              # Equal byte size means it has not yet been replaced by rendered output.
-              if str(raw.get('size','')) != str(target.get('size','')):
-                  continue
-              candidate={'episode_id':episode_id,'folder_id':folder,'raw':raw,'target':target}
+              if not raw or not target: continue
+              if str(raw.get('size','')) != str(target.get('size','')): continue
+              candidate={'episode_id':episode_id,'raw':raw,'target':target}
               break
 
           if not candidate:
@@ -120,12 +110,10 @@ jobs:
 
           download(candidate['raw']['id'],'/tmp/mbff-main.mp4')
           download(os.environ['OUTRO_FILE_ID'],'/tmp/mbff-outro-landscape.mp4')
-          pathlib.Path('/tmp/mbff-render-meta.json').write_text(json.dumps(candidate))
-          print(json.dumps({'ok':True,'status':'INPUTS_READY','episode_id':candidate['episode_id'],'target_file_id':candidate['target']['id']}))
+          Path('/tmp/mbff-render-meta.json').write_text(json.dumps(candidate))
+          print(json.dumps({'ok':True,'status':'INPUTS_READY','episode_id':candidate['episode_id']}))
           PY
-          rc=$?
-          echo "$rc" > /tmp/mbff-render-select.code
-          exit "$rc"
+          exit $?
 
       - name: Render landscape master on Oracle
         id: render
@@ -133,10 +121,7 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          if [ ! -s /tmp/mbff-render-meta.json ]; then
-            echo 0 > /tmp/mbff-render.code
-            exit 0
-          fi
+          if [ ! -s /tmp/mbff-render-meta.json ]; then exit 0; fi
           ffmpeg -y \
             -i /tmp/mbff-main.mp4 -i /tmp/mbff-outro-landscape.mp4 \
             -filter_complex "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0];[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1];[0:a]aformat=sample_rates=48000:channel_layouts=stereo[a0];[1:a]aformat=sample_rates=48000:channel_layouts=stereo[a1];[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]" \
@@ -145,9 +130,7 @@ jobs:
             -c:a aac -b:a 192k \
             /tmp/mbff-master-with-outro.mp4 \
             > /tmp/mbff-render-ffmpeg.log 2>&1
-          rc=$?
-          echo "$rc" > /tmp/mbff-render.code
-          exit "$rc"
+          exit $?
 
       - name: Validate and replace Drive output placeholder
         id: upload
@@ -162,7 +145,7 @@ jobs:
           ffprobe -v error -print_format json -show_format -show_streams /tmp/mbff-main.mp4 > /tmp/mbff-main.ffprobe.json
           ffprobe -v error -print_format json -show_format -show_streams /tmp/mbff-master-with-outro.mp4 > /tmp/mbff-master.ffprobe.json
           /tmp/mbff-render-venv/bin/python - <<'PY' > /tmp/mbff-render-result.json 2>/tmp/mbff-render-upload.err
-          import json, os
+          import json
           from pathlib import Path
           import google.auth
           from google.auth.transport.requests import AuthorizedSession
@@ -170,30 +153,22 @@ jobs:
           main=json.loads(Path('/tmp/mbff-main.ffprobe.json').read_text())
           out=json.loads(Path('/tmp/mbff-master.ffprobe.json').read_text())
           meta=json.loads(Path('/tmp/mbff-render-meta.json').read_text())
-
-          def duration(d): return float(d.get('format',{}).get('duration',0.0))
-          streams=out.get('streams',[])
-          vids=[s for s in streams if s.get('codec_type')=='video']
-          auds=[s for s in streams if s.get('codec_type')=='audio']
-          if not vids or not auds: raise RuntimeError('missing audio/video stream')
-          v=vids[0]
-          if int(v.get('width',0)) != 1920 or int(v.get('height',0)) != 1080:
-              raise RuntimeError('wrong output dimensions')
-          if duration(out) <= duration(main)+1.0:
-              raise RuntimeError('outro duration not appended')
+          def dur(x): return float(x.get('format',{}).get('duration',0))
+          vids=[s for s in out.get('streams',[]) if s.get('codec_type')=='video']
+          auds=[s for s in out.get('streams',[]) if s.get('codec_type')=='audio']
+          if not vids or not auds: raise RuntimeError('missing audio/video')
+          if int(vids[0].get('width',0))!=1920 or int(vids[0].get('height',0))!=1080: raise RuntimeError('wrong dimensions')
+          if dur(out) <= dur(main)+1: raise RuntimeError('outro not appended')
           p=Path('/tmp/mbff-master-with-outro.mp4')
-          if p.stat().st_size < 1_000_000:
-              raise RuntimeError('render output too small')
+          if p.stat().st_size < 1_000_000: raise RuntimeError('output too small')
 
-          DRIVE_SCOPE='https://www.googleapis.com/auth/drive'
-          UPLOAD='https://www.googleapis.com/upload/drive/v3/files'
-          creds,_=google.auth.default(scopes=[DRIVE_SCOPE])
+          creds,_=google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
           s=AuthorizedSession(creds)
           target=meta['target']['id']
           with p.open('rb') as f:
-              r=s.patch(f'{UPLOAD}/{target}',params={'uploadType':'media','supportsAllDrives':'true'},headers={'Content-Type':'video/mp4'},data=f,timeout=600)
+              r=s.patch(f'https://www.googleapis.com/upload/drive/v3/files/{target}',params={'uploadType':'media','supportsAllDrives':'true'},headers={'Content-Type':'video/mp4'},data=f,timeout=600)
           if not r.ok: raise RuntimeError(f'upload HTTP {r.status_code}')
-          print(json.dumps({'ok':True,'status':'RENDER_COMPLETE','episode_id':meta['episode_id'],'target_file_id':target,'duration_seconds':round(duration(out),3),'width':1920,'height':1080,'has_audio':True,'has_video':True,'size_bytes':p.stat().st_size},sort_keys=True))
+          print(json.dumps({'ok':True,'status':'RENDER_COMPLETE','episode_id':meta['episode_id'],'duration_seconds':round(dur(out),3),'width':1920,'height':1080,'has_audio':True,'has_video':True,'size_bytes':p.stat().st_size},sort_keys=True))
           PY
 
       - name: Commit sanitized render evidence
