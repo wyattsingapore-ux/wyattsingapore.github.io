@@ -1,0 +1,183 @@
+name: mbff-oracle-recover-time-dilation
+
+on:
+  push:
+    paths:
+      - ".mbff-control/recover-time-dilation.json"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-oracle-production
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: self-hosted
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Oracle and request
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('.mbff-control/recover-time-dilation.json').read_text())
+          assert d == {"schema_version":1,"action":"recover_existing_time_dilation","mutating":True,"nonce":1}
+          PY
+
+      - name: Authenticate keylessly to MBFF Google project
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Recover existing NotebookLM video on Oracle
+        id: recover
+        continue-on-error: true
+        env:
+          NB_ID: ef32ab87-5716-4125-acfd-28234d5f9b5d
+          ART_ID: 06a89b8e-23d8-4d5c-978e-106da6afb177
+          DRIVE_FILE_ID: 1-U3nR3B_ITxy_Npz1ngDZcXDKSZKOHfg
+        run: |
+          set +e
+          ROOT="$HOME/mbff-notebooklm-worker"
+          AUTH="$ROOT/auth/storage_state.json"
+          OUT="$ROOT/downloads/day48/day48_notebooklm_raw.mp4"
+          TMPV="$ROOT/recovery-venv-081"
+          mkdir -p "$(dirname "$OUT")"
+          rm -f "$OUT"
+
+          result=/tmp/mbff-recover-result.json
+          printf '%s\n' '{"ok":false,"status":"STARTED"}' > "$result"
+
+          if [ ! -s "$AUTH" ]; then
+            printf '%s\n' '{"ok":false,"status":"NOTEBOOKLM_AUTH_MISSING"}' > "$result"
+            exit 0
+          fi
+
+          # Use a clean current CLI for this recovery so old worker CLI behavior
+          # cannot mask the result. The production worker remains separate.
+          if [ ! -x "$TMPV/bin/notebooklm" ]; then
+            python3 -m venv "$TMPV" >/tmp/mbff-recover-venv.out 2>/tmp/mbff-recover-venv.err || {
+              printf '%s\n' '{"ok":false,"status":"RECOVERY_VENV_FAILED"}' > "$result"; exit 0; }
+            "$TMPV/bin/python" -m pip install -q 'notebooklm-py==0.8.1' >/tmp/mbff-recover-pip.out 2>/tmp/mbff-recover-pip.err || {
+              printf '%s\n' '{"ok":false,"status":"RECOVERY_CLI_INSTALL_FAILED"}' > "$result"; exit 0; }
+          fi
+
+          # Real authenticated notebook read. Never echo notebook list to logs.
+          "$TMPV/bin/notebooklm" --storage "$AUTH" list --json >/tmp/mbff-recover-list.json 2>/tmp/mbff-recover-list.err
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"ORACLE_NOTEBOOKLM_AUTH_FAILED"}' > "$result"
+            exit 0
+          fi
+
+          python3 - <<'PY'
+          import json, os, sys
+          p='/tmp/mbff-recover-list.json'
+          try: d=json.load(open(p))
+          except Exception: sys.exit(2)
+          rows=d.get('notebooks',[]) if isinstance(d,dict) else []
+          target=os.environ['NB_ID']
+          sys.exit(0 if any(str(x.get('id'))==target for x in rows if isinstance(x,dict)) else 3)
+          PY
+          case $? in
+            0) ;;
+            3) printf '%s\n' '{"ok":false,"status":"TARGET_NOTEBOOK_NOT_FOUND"}' > "$result"; exit 0 ;;
+            *) printf '%s\n' '{"ok":false,"status":"NOTEBOOK_LIST_PARSE_FAILED"}' > "$result"; exit 0 ;;
+          esac
+
+          # Artifact list is diagnostic only. Direct download is the readiness test.
+          "$TMPV/bin/notebooklm" --storage "$AUTH" artifact list -n "$NB_ID" --type video --json >/tmp/mbff-recover-artifacts.json 2>/tmp/mbff-recover-artifacts.err
+
+          "$TMPV/bin/notebooklm" --storage "$AUTH" download cinematic-video "$OUT" -n "$NB_ID" -a "$ART_ID" --force --json >/tmp/mbff-recover-download.json 2>/tmp/mbff-recover-download.err
+          dlrc=$?
+          if [ "$dlrc" -ne 0 ]; then
+            if grep -Eqi '401|Authentication required' /tmp/mbff-recover-download.err /tmp/mbff-recover-download.json 2>/dev/null; then
+              printf '%s\n' '{"ok":false,"status":"MEDIA_CDN_AUTH_401"}' > "$result"
+            elif grep -Eqi '403' /tmp/mbff-recover-download.err /tmp/mbff-recover-download.json 2>/dev/null; then
+              printf '%s\n' '{"ok":false,"status":"MEDIA_CDN_AUTH_403"}' > "$result"
+            else
+              printf '%s\n' '{"ok":false,"status":"DIRECT_DOWNLOAD_FAILED"}' > "$result"
+            fi
+            rm -f "$OUT"
+            exit 0
+          fi
+
+          # Strong media QC.
+          ffprobe -v error -show_streams -show_format -of json "$OUT" >/tmp/mbff-recover-ffprobe.json 2>/tmp/mbff-recover-ffprobe.err
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"FFPROBE_FAILED"}' > "$result"; rm -f "$OUT"; exit 0
+          fi
+
+          OUT="$OUT" python3 - <<'PY'
+          import json, os, sys
+          d=json.load(open('/tmp/mbff-recover-ffprobe.json'))
+          streams=d.get('streams',[])
+          vs=[s for s in streams if s.get('codec_type')=='video']
+          aus=[s for s in streams if s.get('codec_type')=='audio']
+          if not vs or not aus: sys.exit(2)
+          w=int(vs[0].get('width') or 0); h=int(vs[0].get('height') or 0)
+          dur=float(d.get('format',{}).get('duration') or 0)
+          size=os.path.getsize(os.environ['OUT'])
+          if not (w>0 and h>0 and abs(w/h-16/9)<=0.08 and dur>=120 and size>=100000): sys.exit(3)
+          json.dump({'width':w,'height':h,'duration_seconds':dur,'bytes':size},open('/tmp/mbff-recover-qc.json','w'))
+          PY
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"MEDIA_QC_FAILED"}' > "$result"; rm -f "$OUT"; exit 0
+          fi
+
+          # Replace bytes in the pre-created user-owned Drive placeholder.
+          OUT="$OUT" "$ROOT/.venv/bin/python" - <<'PY' >/tmp/mbff-recover-drive.out 2>/tmp/mbff-recover-drive.err
+          import os, google.auth, requests
+          from google.auth.transport.requests import AuthorizedSession
+          creds,_=google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
+          s=AuthorizedSession(creds)
+          fid=os.environ['DRIVE_FILE_ID']; path=os.environ['OUT']
+          with open(path,'rb') as f:
+              r=s.patch(f'https://www.googleapis.com/upload/drive/v3/files/{fid}?uploadType=media',data=f,headers={'Content-Type':'video/mp4'},timeout=900)
+          r.raise_for_status()
+          print(r.status_code)
+          PY
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"DRIVE_UPLOAD_FAILED"}' > "$result"; exit 0
+          fi
+
+          python3 - <<'PY'
+          import json
+          q=json.load(open('/tmp/mbff-recover-qc.json'))
+          out={'ok':True,'status':'RECOVERED_TO_DRIVE','notebook_id':'ef32ab87-5716-4125-acfd-28234d5f9b5d','artifact_id':'06a89b8e-23d8-4d5c-978e-106da6afb177','drive_file_id':'1-U3nR3B_ITxy_Npz1ngDZcXDKSZKOHfg','qc':q}
+          json.dump(out,open('/tmp/mbff-recover-result.json','w'),indent=2,sort_keys=True)
+          PY
+          exit 0
+
+      - name: Commit sanitized recovery evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-control/results
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          try: d=json.loads(Path('/tmp/mbff-recover-result.json').read_text())
+          except Exception: d={'ok':False,'status':'RECOVERY_RESULT_MISSING'}
+          safe={k:d.get(k) for k in ('ok','status','notebook_id','artifact_id','drive_file_id','qc') if k in d}
+          safe['schema_version']=1
+          safe['checked_at']=datetime.now(timezone.utc).isoformat()
+          Path('.mbff-control/results/recover-time-dilation.json').write_text(json.dumps(safe,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name "mbff-oracle-worker"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-control/results/recover-time-dilation.json
+          git commit -m "Record MBFF time dilation Oracle recovery" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
