@@ -1,8 +1,8 @@
 {
-  "admin_users": [],
-  "checked_at": "2026-08-18T04:33:17.594413+00:00",
-  "completed": false,
-  "error": "iam_policy_read_denied",
-  "project_id": "project-2fe92524-b20b-4186-bef",
+  "active_account_class": "human",
+  "bot_active": false,
+  "checked_at": "2026-08-18T04:42:48.156457+00:00",
+  "completed": true,
+  "human_active": true,
   "schema_version": 1
 }
