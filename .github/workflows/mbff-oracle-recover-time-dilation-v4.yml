@@ -1,0 +1,181 @@
+name: mbff-oracle-recover-time-dilation-v4
+
+on:
+  push:
+    paths:
+      - ".mbff-control/recover-time-dilation-v4.json"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-oracle-production
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    env:
+      NB_ID: ef32ab87-5716-4125-acfd-28234d5f9b5d
+      ART_ID: 06a89b8e-23d8-4d5c-978e-106da6afb177
+      DRIVE_FILE_ID: 1-U3nR3B_ITxy_Npz1ngDZcXDKSZKOHfg
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Oracle host
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+
+      - name: Authenticate keylessly to MBFF Google project
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Ensure media QC dependency and recover existing video
+        continue-on-error: true
+        run: |
+          set +e
+          ROOT="$HOME/mbff-notebooklm-worker"
+          AUTH="$ROOT/auth/storage_state.json"
+          CLI="$ROOT/recovery-venv-081/bin/notebooklm"
+          OUT="$ROOT/downloads/day48/day48_notebooklm_raw.mp4"
+          RESULT=/tmp/mbff-recover-v4-result.json
+          DEFAULT_DIR="$HOME/.notebooklm/profiles/default"
+          DEFAULT_AUTH="$DEFAULT_DIR/storage_state.json"
+          mkdir -p "$(dirname "$OUT")" "$DEFAULT_DIR"
+          rm -f "$OUT"
+          printf '%s\n' '{"ok":false,"status":"STARTED"}' > "$RESULT"
+
+          installed_now=false
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update -qq >/tmp/mbff-v4-apt-update.out 2>/tmp/mbff-v4-apt-update.err
+            if [ $? -ne 0 ]; then
+              printf '%s\n' '{"ok":false,"status":"FFPROBE_MISSING_APT_UPDATE_FAILED"}' > "$RESULT"; exit 0
+            fi
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg >/tmp/mbff-v4-apt-install.out 2>/tmp/mbff-v4-apt-install.err
+            if [ $? -ne 0 ]; then
+              printf '%s\n' '{"ok":false,"status":"FFPROBE_INSTALL_FAILED"}' > "$RESULT"; exit 0
+            fi
+            installed_now=true
+          fi
+          if ! command -v ffprobe >/dev/null 2>&1; then
+            printf '%s\n' '{"ok":false,"status":"FFPROBE_STILL_MISSING"}' > "$RESULT"; exit 0
+          fi
+
+          chmod 600 "$AUTH"
+          ln -sfn "$AUTH" "$DEFAULT_AUTH"
+
+          "$CLI" list --json >/tmp/mbff-v4-list.json 2>/tmp/mbff-v4-list.err
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"ORACLE_NOTEBOOKLM_AUTH_FAILED"}' > "$RESULT"; exit 0
+          fi
+
+          "$CLI" download video "$OUT" -n "$NB_ID" -a "$ART_ID" --force --json >/tmp/mbff-v4-download.json 2>/tmp/mbff-v4-download.err
+          rc=$?
+          if [ "$rc" -ne 0 ]; then
+            python3 - <<'PY'
+          import json,re
+          from pathlib import Path
+          raw=''
+          for p in ('/tmp/mbff-v4-download.err','/tmp/mbff-v4-download.json'):
+              try: raw+='\n'+Path(p).read_text(errors='replace')
+              except Exception: pass
+          low=raw.lower()
+          if '401' in low or 'authentication required' in low: status='MEDIA_CDN_AUTH_401'
+          elif '403' in low: status='MEDIA_CDN_AUTH_403'
+          else: status='DIRECT_DOWNLOAD_FAILED'
+          safe=re.sub(r'https?://\S+','<redacted-url>',raw)
+          safe=re.sub(r'(?i)(cookie|authorization|token)(\s*[:=]\s*)\S+',r'\1\2<redacted>',safe)
+          safe=re.sub(r'[A-Za-z0-9_\-]{80,}','<redacted-long-value>',safe)
+          safe=' '.join(safe.split())[:500]
+          json.dump({'ok':False,'status':status,'detail':safe},open('/tmp/mbff-recover-v4-result.json','w'),indent=2,sort_keys=True)
+          PY
+            rm -f "$OUT"; exit 0
+          fi
+
+          if [ ! -f "$OUT" ]; then
+            printf '%s\n' '{"ok":false,"status":"DOWNLOAD_EXITED_ZERO_BUT_FILE_MISSING"}' > "$RESULT"; exit 0
+          fi
+          bytes=$(stat -c %s "$OUT" 2>/dev/null || echo 0)
+          mime=$(file -b --mime-type "$OUT" 2>/dev/null || echo unknown)
+
+          ffprobe -v error -show_streams -show_format -of json "$OUT" >/tmp/mbff-v4-ffprobe.json 2>/tmp/mbff-v4-ffprobe.err
+          ffrc=$?
+          if [ "$ffrc" -ne 0 ]; then
+            BYTES="$bytes" MIME="$mime" INSTALLED_NOW="$installed_now" python3 - <<'PY'
+          import json,re,os
+          from pathlib import Path
+          try: raw=Path('/tmp/mbff-v4-ffprobe.err').read_text(errors='replace')
+          except Exception: raw=''
+          safe=re.sub(r'https?://\S+','<redacted-url>',raw)
+          safe=' '.join(safe.split())[:300]
+          json.dump({'ok':False,'status':'FFPROBE_MEDIA_INVALID','bytes':int(os.environ.get('BYTES','0')),'mime':os.environ.get('MIME','unknown'),'ffprobe_installed_now':os.environ.get('INSTALLED_NOW')=='true','detail':safe},open('/tmp/mbff-recover-v4-result.json','w'),indent=2,sort_keys=True)
+          PY
+            rm -f "$OUT"; exit 0
+          fi
+
+          OUT="$OUT" INSTALLED_NOW="$installed_now" python3 - <<'PY'
+          import json,os,sys
+          d=json.load(open('/tmp/mbff-v4-ffprobe.json'))
+          streams=d.get('streams',[])
+          v=[s for s in streams if s.get('codec_type')=='video']
+          a=[s for s in streams if s.get('codec_type')=='audio']
+          if not v or not a: sys.exit(2)
+          w=int(v[0].get('width') or 0); h=int(v[0].get('height') or 0)
+          dur=float(d.get('format',{}).get('duration') or 0)
+          size=os.path.getsize(os.environ['OUT'])
+          if not (w and h and abs(w/h-16/9)<=0.08 and dur>=120 and size>=100000): sys.exit(3)
+          json.dump({'bytes':size,'width':w,'height':h,'duration_seconds':dur,'ffprobe_installed_now':os.environ.get('INSTALLED_NOW')=='true'},open('/tmp/mbff-v4-qc.json','w'))
+          PY
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"MEDIA_QC_FAILED"}' > "$RESULT"; rm -f "$OUT"; exit 0
+          fi
+
+          OUT="$OUT" "$ROOT/.venv/bin/python" - <<'PY' >/tmp/mbff-v4-drive.out 2>/tmp/mbff-v4-drive.err
+          import os,google.auth
+          from google.auth.transport.requests import AuthorizedSession
+          creds,_=google.auth.default(scopes=['https://www.googleapis.com/auth/drive'])
+          s=AuthorizedSession(creds)
+          with open(os.environ['OUT'],'rb') as f:
+              r=s.patch('https://www.googleapis.com/upload/drive/v3/files/'+os.environ['DRIVE_FILE_ID']+'?uploadType=media',data=f,headers={'Content-Type':'video/mp4'},timeout=900)
+          r.raise_for_status()
+          PY
+          if [ $? -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"DRIVE_UPLOAD_FAILED"}' > "$RESULT"; exit 0
+          fi
+
+          python3 - <<'PY'
+          import json
+          q=json.load(open('/tmp/mbff-v4-qc.json'))
+          json.dump({'ok':True,'status':'RECOVERED_TO_DRIVE','notebook_id':'ef32ab87-5716-4125-acfd-28234d5f9b5d','artifact_id':'06a89b8e-23d8-4d5c-978e-106da6afb177','drive_file_id':'1-U3nR3B_ITxy_Npz1ngDZcXDKSZKOHfg','qc':q,'default_profile_shim':True},open('/tmp/mbff-recover-v4-result.json','w'),indent=2,sort_keys=True)
+          PY
+
+      - name: Commit sanitized recovery evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-control/results
+          python3 - <<'PY'
+          import json
+          from datetime import datetime,timezone
+          from pathlib import Path
+          try: d=json.loads(Path('/tmp/mbff-recover-v4-result.json').read_text())
+          except Exception: d={'ok':False,'status':'RECOVERY_RESULT_MISSING'}
+          d['schema_version']=1
+          d['checked_at']=datetime.now(timezone.utc).isoformat()
+          d['run_id']='${{ github.run_id }}'
+          Path('.mbff-control/results/recover-time-dilation-v4.json').write_text(json.dumps(d,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name "mbff-oracle-worker"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-control/results/recover-time-dilation-v4.json
+          git commit -m "Record MBFF Oracle video recovery v4" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
