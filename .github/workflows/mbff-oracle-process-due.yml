@@ -1,0 +1,89 @@
+name: mbff-oracle-process-due
+
+on:
+  push:
+    paths:
+      - ".mbff-control/process-due.json"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-oracle-production
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: self-hosted
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Oracle host and generic request
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('.mbff-control/process-due.json').read_text())
+          assert d.get('schema_version') == 1
+          assert d.get('action') == 'process_due_mbff'
+          assert d.get('mutating') is True
+          # Public control request intentionally carries no episode details.
+          assert not any(k in d for k in ('title','sources','prompt','episode_folder_id'))
+          PY
+
+      - name: Authenticate keylessly to MBFF Google project
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Run persistent Oracle NotebookLM queue worker
+        id: worker
+        run: |
+          set -euo pipefail
+          ROOT="$HOME/mbff-notebooklm-worker"
+          test -x "$ROOT/app/worker.py"
+          test -x "$ROOT/app/drive_runner.py"
+          command -v ffprobe >/dev/null
+          PYTHONPATH="$ROOT/app" "$ROOT/.venv/bin/python" "$ROOT/app/drive_runner.py" > /tmp/mbff-process-due-result.json
+
+      - name: Commit only sanitized execution evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-control/results
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          p=Path('/tmp/mbff-process-due-result.json')
+          status='WORKER_FAILED'
+          ok=False
+          if p.exists():
+              try:
+                  d=json.loads(p.read_text())
+                  ok=bool(d.get('ok'))
+                  status=str(d.get('status') or ('COMPLETE' if ok else 'FAILED'))[:80]
+              except Exception:
+                  status='UNPARSEABLE_WORKER_RESULT'
+          out={
+              'schema_version':1,
+              'completed':ok,
+              'status':status,
+              'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-control/results/process-due.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name "mbff-oracle-worker"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-control/results/process-due.json
+          git commit -m "Record sanitized MBFF Oracle execution" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
