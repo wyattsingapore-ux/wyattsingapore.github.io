@@ -1,0 +1,103 @@
+name: mbff-drive-wif-smoke
+
+on:
+  push:
+    paths:
+      - ".mbff-bootstrap/drive-wif-smoke.json"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-drive-wif-smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    runs-on: self-hosted
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Oracle host and request
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('.mbff-bootstrap/drive-wif-smoke.json').read_text())
+          assert d.get('schema_version') == 1
+          assert d.get('action') == 'drive_wif_smoke'
+          assert d.get('mutating') is False
+          PY
+
+      - name: Authenticate keylessly to Google
+        id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/drive
+          create_credentials_file: true
+
+      - name: Probe MBFF Drive folders read-only
+        env:
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-bootstrap/results
+          python3 - <<'PY'
+          import json, os, urllib.parse, urllib.request, urllib.error
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          token=os.environ['ACCESS_TOKEN']
+          targets={
+            'mbff_root':'1po6Z-46Z8Qrs_uGnnwXGK7gcTb0ZXdOW',
+            'cloud_control':'1rQhGJPo0cs8fPMixRPeCSKukyZ41y44d',
+            'jobs':'19lQQJpzToSIamqR2h16KaXSM8afwxZfX',
+            'state':'1OfuApuyWQ66aBxkxSQUwirRAI7inlnyX',
+            'logs':'13uzx_A-o9TsO8UNyHJaWN3XDaOAtDnwm',
+          }
+          def get(url):
+            req=urllib.request.Request(url,headers={'Authorization':f'Bearer {token}'})
+            try:
+              with urllib.request.urlopen(req,timeout=30) as r:
+                return r.status, json.loads(r.read().decode() or '{}')
+            except urllib.error.HTTPError as e:
+              return e.code, {}
+          result={}
+          for name,fid in targets.items():
+            q=urllib.parse.urlencode({'fields':'id,name,mimeType','supportsAllDrives':'true'})
+            code,data=get(f'https://www.googleapis.com/drive/v3/files/{fid}?{q}')
+            result[name]={'http_status':code,'accessible':code==200,'name_match':bool(data.get('name')) if code==200 else False}
+          q=urllib.parse.urlencode({'q':f"'{targets['jobs']}' in parents and trashed = false",'pageSize':'10','fields':'files(id,name)','supportsAllDrives':'true','includeItemsFromAllDrives':'true'})
+          code,data=get(f'https://www.googleapis.com/drive/v3/files?{q}')
+          result['jobs_list']={'http_status':code,'accessible':code==200,'count':len(data.get('files',[])) if code==200 else 0}
+          payload={
+            'schema_version':1,
+            'completed':True,
+            'keyless_auth_succeeded':True,
+            'all_folders_accessible':all(v.get('accessible') for k,v in result.items() if k!='jobs_list'),
+            'probes':result,
+            'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-bootstrap/results/drive-wif-smoke.json').write_text(json.dumps(payload,indent=2,sort_keys=True)+'\n')
+          PY
+
+      - name: Commit sanitized result
+        if: always()
+        run: |
+          set -euo pipefail
+          test -f .mbff-bootstrap/results/drive-wif-smoke.json || exit 0
+          git config user.name "mbff-oracle-bootstrap"
+          git config user.email "actions@users.noreply.github.com"
+          git add .mbff-bootstrap/results/drive-wif-smoke.json
+          git commit -m "Record MBFF Drive WIF smoke test" || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
