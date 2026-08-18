@@ -1,0 +1,21 @@
+{
+  "checked_at": "2026-08-18T09:50:52.842326+00:00",
+  "completed": true,
+  "exit_code": 0,
+  "master": {
+    "bytes": 147555736,
+    "duration_seconds": 344.667,
+    "height": 1080,
+    "sha256": "f59ba010102047d9e3cf6180e46d4694d100456acbf3a6749ac41e6cd09b79d1",
+    "width": 1920
+  },
+  "schema_version": 1,
+  "short": {
+    "bytes": 10510767,
+    "duration_seconds": 59.0,
+    "height": 1920,
+    "sha256": "64d1ddd2e6ce7bbf7b6cec4599b5c813f333ad7662671f4046a9e15aee618bb0",
+    "width": 1080
+  },
+  "status": "MEDIA_PROOF_COMPLETE"
+}
