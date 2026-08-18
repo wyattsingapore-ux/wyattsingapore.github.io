@@ -1,0 +1,105 @@
+name: mbff-oracle-render-social-short
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.mbff-control/render-social-short.json'
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-oracle-social-short
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: self-hosted
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify Oracle host and generic request
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('.mbff-control/render-social-short.json').read_text())
+          assert d.get('schema_version')==1
+          assert d.get('action')=='render_current_mbff_social_short'
+          assert d.get('mutating') is True
+          assert not any(k in d for k in ('episode_id','title','drive_file_id','outro_drive_id','output_drive_id','prompt'))
+          PY
+
+      - name: Authenticate keylessly to MBFF Drive
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Render current private social-short job
+        id: render
+        continue-on-error: true
+        run: |
+          set +e
+          ROOT="$HOME/mbff-publisher"
+          PYTHONPATH="$ROOT/app" "$ROOT/.venv/bin/python" "$ROOT/app/render_social_short.py" --job "$ROOT/jobs/day48.short.json" > /tmp/mbff-short-result.json 2>/tmp/mbff-short-error.txt
+          echo $? > /tmp/mbff-short-exit.txt
+          exit 0
+
+      - name: Commit sanitized render evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-control/results
+          python3 - <<'PY'
+          import json
+          from datetime import datetime,timezone
+          from pathlib import Path
+          try: rc=int(Path('/tmp/mbff-short-exit.txt').read_text().strip())
+          except Exception: rc=999
+          try: d=json.loads(Path('/tmp/mbff-short-result.json').read_text())
+          except Exception: d={}
+          err=''
+          try: err=Path('/tmp/mbff-short-error.txt').read_text(errors='replace')
+          except Exception: pass
+          low=err.lower()
+          failure='none'
+          if rc!=0:
+            if 'whisper' in low: failure='transcription'
+            elif 'subtitles' in low or 'libass' in low: failure='caption_render'
+            elif 'drive' in low: failure='drive'
+            elif 'qc failed' in low: failure='qc'
+            elif 'ffmpeg' in low: failure='ffmpeg'
+            else: failure='render'
+          ok=rc==0 and d.get('completed') is True
+          out={
+            'schema_version':1,
+            'completed':ok,
+            'status':d.get('status') if ok else 'SOCIAL_SHORT_FAILED',
+            'failure_class':failure,
+            'hook_start_seconds':d.get('hook_start_seconds') if ok else None,
+            'caption_events':d.get('caption_events') if ok else None,
+            'duration_seconds':d.get('duration_seconds') if ok else None,
+            'width':d.get('width') if ok else None,
+            'height':d.get('height') if ok else None,
+            'bytes':d.get('bytes') if ok else None,
+            'sha256':d.get('sha256') if ok else None,
+            'output_id_suffix':str(d.get('output_drive_id') or '')[-8:] if ok else None,
+            'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-control/results/render-social-short.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name 'mbff-oracle-worker'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .mbff-control/results/render-social-short.json
+          git commit -m 'Record sanitized MBFF social-short render' || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
