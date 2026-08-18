@@ -78,6 +78,17 @@ jobs:
         run: |
           set +e
           ROOT="$HOME/mbff-notebooklm-worker"
+
+          # Real NotebookLM access is the auth gate. The lightweight auth-check
+          # command can remain green after the Google web session has expired.
+          "$ROOT/bin/notebooklm" list --json > /tmp/mbff-nlm-live-list.json 2>/tmp/mbff-nlm-live-list.err
+          live_rc=$?
+          if [ "$live_rc" -ne 0 ]; then
+            printf '%s\n' '{"ok":false,"status":"NOTEBOOKLM_AUTH_REQUIRED"}' > /tmp/mbff-process-due-result.json
+            echo 3 > /tmp/mbff-process-due-exit.txt
+            exit 0
+          fi
+
           PYTHONPATH="$ROOT/app" "$ROOT/.venv/bin/python" "$ROOT/app/drive_runner.py" > /tmp/mbff-process-due-result.json 2>/tmp/mbff-process-due-error.txt
           echo $? > /tmp/mbff-process-due-exit.txt
           exit 0
@@ -88,7 +99,7 @@ jobs:
           set -euo pipefail
           mkdir -p .mbff-control/results
           python3 - <<'PY'
-          import json,re
+          import json
           from datetime import datetime, timezone
           from pathlib import Path
           def load_json(p, default):
@@ -104,15 +115,18 @@ jobs:
           try: err=Path('/tmp/mbff-process-due-error.txt').read_text(errors='replace')
           except Exception: pass
           failure='none'
-          for label,pat in [
-              ('default_credentials','DefaultCredentialsError'),
-              ('module_missing','ModuleNotFoundError'),
-              ('drive_permission','HTTP 403'),
-              ('drive_not_found','HTTP 404'),
-              ('python_traceback','Traceback'),
-          ]:
-              if pat in err:
-                  failure=label; break
+          if status == 'NOTEBOOKLM_AUTH_REQUIRED':
+              failure='notebooklm_auth'
+          else:
+              for label,pat in [
+                  ('default_credentials','DefaultCredentialsError'),
+                  ('module_missing','ModuleNotFoundError'),
+                  ('drive_permission','HTTP 403'),
+                  ('drive_not_found','HTTP 404'),
+                  ('python_traceback','Traceback'),
+              ]:
+                  if pat in err:
+                      failure=label; break
           out={
               'schema_version':1,
               'completed':ok,
