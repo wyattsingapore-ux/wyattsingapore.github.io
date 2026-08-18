@@ -32,7 +32,6 @@ jobs:
           assert d.get('schema_version') == 1
           assert d.get('action') == 'process_due_mbff'
           assert d.get('mutating') is True
-          # Public control request intentionally carries no episode details.
           assert not any(k in d for k in ('title','sources','prompt','episode_folder_id'))
           PY
 
@@ -44,15 +43,44 @@ jobs:
           service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
           create_credentials_file: true
 
+      - name: Probe Oracle MBFF runtime
+        run: |
+          set +e
+          ROOT="$HOME/mbff-notebooklm-worker"
+          ROOT="$ROOT" "$ROOT/.venv/bin/python" - <<'PY' > /tmp/mbff-runtime-preflight.json 2>/tmp/mbff-runtime-preflight.err
+          import json, os, pathlib
+          root=pathlib.Path(os.environ['ROOT'])
+          out={
+            'worker_exists':(root/'app/worker.py').is_file(),
+            'drive_runner_exists':(root/'app/drive_runner.py').is_file(),
+            'worker_executable':os.access(root/'app/worker.py', os.X_OK),
+            'drive_runner_executable':os.access(root/'app/drive_runner.py', os.X_OK),
+            'adc_env_present':bool(os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')),
+          }
+          try:
+            import google.auth
+            from google.auth.transport.requests import AuthorizedSession
+            out['google_auth_import']=True
+          except Exception:
+            out['google_auth_import']=False
+          try:
+            import requests
+            out['requests_import']=True
+          except Exception:
+            out['requests_import']=False
+          print(json.dumps(out,sort_keys=True))
+          PY
+          echo $? > /tmp/mbff-runtime-preflight.code
+
       - name: Run persistent Oracle NotebookLM queue worker
         id: worker
+        continue-on-error: true
         run: |
-          set -euo pipefail
+          set +e
           ROOT="$HOME/mbff-notebooklm-worker"
-          test -x "$ROOT/app/worker.py"
-          test -x "$ROOT/app/drive_runner.py"
-          command -v ffprobe >/dev/null
-          PYTHONPATH="$ROOT/app" "$ROOT/.venv/bin/python" "$ROOT/app/drive_runner.py" > /tmp/mbff-process-due-result.json
+          PYTHONPATH="$ROOT/app" "$ROOT/.venv/bin/python" "$ROOT/app/drive_runner.py" > /tmp/mbff-process-due-result.json 2>/tmp/mbff-process-due-error.txt
+          echo $? > /tmp/mbff-process-due-exit.txt
+          exit 0
 
       - name: Commit only sanitized execution evidence
         if: always()
@@ -60,23 +88,38 @@ jobs:
           set -euo pipefail
           mkdir -p .mbff-control/results
           python3 - <<'PY'
-          import json
+          import json,re
           from datetime import datetime, timezone
           from pathlib import Path
-          p=Path('/tmp/mbff-process-due-result.json')
-          status='WORKER_FAILED'
-          ok=False
-          if p.exists():
-              try:
-                  d=json.loads(p.read_text())
-                  ok=bool(d.get('ok'))
-                  status=str(d.get('status') or ('COMPLETE' if ok else 'FAILED'))[:80]
-              except Exception:
-                  status='UNPARSEABLE_WORKER_RESULT'
+          def load_json(p, default):
+              try: return json.loads(Path(p).read_text())
+              except Exception: return default
+          pre=load_json('/tmp/mbff-runtime-preflight.json',{})
+          try: rc=int(Path('/tmp/mbff-process-due-exit.txt').read_text().strip())
+          except Exception: rc=999
+          d=load_json('/tmp/mbff-process-due-result.json',{})
+          ok=(rc==0 and bool(d.get('ok')))
+          status=str(d.get('status') or ('COMPLETE' if ok else 'WORKER_FAILED'))[:80]
+          err=''
+          try: err=Path('/tmp/mbff-process-due-error.txt').read_text(errors='replace')
+          except Exception: pass
+          failure='none'
+          for label,pat in [
+              ('default_credentials','DefaultCredentialsError'),
+              ('module_missing','ModuleNotFoundError'),
+              ('drive_permission','HTTP 403'),
+              ('drive_not_found','HTTP 404'),
+              ('python_traceback','Traceback'),
+          ]:
+              if pat in err:
+                  failure=label; break
           out={
               'schema_version':1,
               'completed':ok,
               'status':status,
+              'worker_exit_code':rc,
+              'failure_class':failure,
+              'runtime':{k:bool(pre.get(k)) for k in ('worker_exists','drive_runner_exists','worker_executable','drive_runner_executable','adc_env_present','google_auth_import','requests_import')},
               'checked_at':datetime.now(timezone.utc).isoformat(),
           }
           Path('.mbff-control/results/process-due.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
