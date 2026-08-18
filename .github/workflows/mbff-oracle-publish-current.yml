@@ -1,0 +1,104 @@
+name: mbff-oracle-publish-current
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.mbff-control/publish-current.json'
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: mbff-oracle-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: self-hosted
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify generic mutating request and Oracle host
+        run: |
+          set -euo pipefail
+          test "$(hostname)" = "instance-20260211-2148"
+          test "$(whoami)" = "ubuntu"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          d=json.loads(Path('.mbff-control/publish-current.json').read_text())
+          assert d.get('schema_version') == 1
+          assert d.get('action') == 'publish_current_mbff'
+          assert d.get('mutating') is True
+          forbidden={'episode_id','title','drive_file_id','source','file_name','caption'}
+          assert not (forbidden & set(d))
+          PY
+
+      - name: Authenticate keylessly to MBFF Google project
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: mbff-cloud-publisher-wt26
+          workload_identity_provider: projects/209601201824/locations/global/workloadIdentityPools/github-mbff/providers/github
+          service_account: mbff-oracle-drive@mbff-cloud-publisher-wt26.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Run Oracle direct publisher
+        id: publish
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          ROOT="$HOME/mbff-publisher"
+          "$ROOT/bin/mbff-publish" run-job \
+            --job "$ROOT/run/current-job.json" \
+            --root "$ROOT" \
+            > /tmp/mbff-publish-current.json 2>/tmp/mbff-publish-current.err
+          echo $? > /tmp/mbff-publish-current.code
+          exit 0
+
+      - name: Commit sanitized publishing evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .mbff-control/results
+          python3 - <<'PY'
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+          try: rc=int(Path('/tmp/mbff-publish-current.code').read_text().strip())
+          except Exception: rc=999
+          try: raw=json.loads(Path('/tmp/mbff-publish-current.json').read_text())
+          except Exception: raw={}
+          platforms={}
+          for name,item in (raw.get('platforms') or {}).items():
+              if not isinstance(item,dict): continue
+              # Only publish non-secret, user-visible receipt fields.
+              platforms[name]={k:item.get(k) for k in ('status','id','url','publish_status') if item.get(k) is not None}
+          media_ok=raw.get('media_prepared') is True
+          statuses=[x.get('status') for x in platforms.values()]
+          published=sum(1 for s in statuses if s=='published')
+          waiting=sum(1 for s in statuses if s=='waiting')
+          auth_required=sum(1 for s in statuses if s=='auth_required')
+          failed=sum(1 for s in statuses if s=='failed')
+          out={
+              'schema_version':1,
+              'completed': bool(media_ok and platforms and published==len(platforms)),
+              'status': 'ALL_PLATFORMS_PUBLISHED' if platforms and published==len(platforms) else ('PARTIAL_OR_BLOCKED' if media_ok else 'PUBLISHER_FAILED'),
+              'publisher_exit_code':rc,
+              'media_prepared':media_ok,
+              'counts':{'published':published,'waiting':waiting,'auth_required':auth_required,'failed':failed,'total':len(platforms)},
+              'platforms':platforms,
+              'checked_at':datetime.now(timezone.utc).isoformat(),
+          }
+          Path('.mbff-control/results/publish-current.json').write_text(json.dumps(out,indent=2,sort_keys=True)+'\n')
+          PY
+          git config user.name 'mbff-oracle-worker'
+          git config user.email 'actions@users.noreply.github.com'
+          git add .mbff-control/results/publish-current.json
+          git commit -m 'Record sanitized MBFF direct publishing result' || exit 0
+          git pull --rebase origin main
+          git push origin HEAD:main
